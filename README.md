@@ -25,8 +25,8 @@ redis-consumer-discovery.sh <subcommand> <env> [output-dir] [--redis <dep>] [--c
 the current directory. Deployment names are not hardcoded; genesis targets them:
 
 ```
-genesis <env>    b <args>   == bosh -e <env>             <args>   # director level; redis via -d
-genesis <env>:cf b <args>   == bosh -e <env> -d <env>-cf <args>   # CF / diego cells
+genesis @<env>    b <args>   == bosh -e <env>             <args>   # director level; redis via -d
+genesis @<env>:cf b <args>   == bosh -e <env> -d <env>-cf <args>   # CF / diego cells
 ```
 
 Preflight:

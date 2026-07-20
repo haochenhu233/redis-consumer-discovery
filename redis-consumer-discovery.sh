@@ -15,9 +15,9 @@
 #   <env>         genesis env name; a trailing ".yml" is stripped.
 #   [output-dir]  where intermediate/output files go; default = current dir.
 #
-# genesis access model (do NOT hardcode deployment names):
-#   genesis <env>    b <args>   == bosh -e <env>            <args>   (director level; redis via -d)
-#   genesis <env>:cf b <args>   == bosh -e <env> -d <env>-cf <args>  (CF / diego cells)
+# genesis access model (do NOT hardcode deployment names; note the leading @):
+#   genesis @<env>    b <args>   == bosh -e <env>             <args>   (director level; redis via -d)
+#   genesis @<env>:cf b <args>   == bosh -e <env> -d <env>-cf <args>   (CF / diego cells)
 #
 # Subcommands:
 #   preflight <env> [out] [--redis <dep>] [--cell <group/idx>]
@@ -29,7 +29,7 @@ SUB="${1:-}"; shift || true
 [ -z "$SUB" ] && { echo "usage: $(basename "$0") <subcommand> <env> [output-dir] [--redis <dep>] [--cell <group/idx>]"; exit 1; }
 ENV="${1:-}"; shift || true
 [ -z "$ENV" ] && { echo "ERROR: <env> is required"; exit 1; }
-ENV="${ENV%.yml}"                                   # strip a trailing .yml
+ENV="${ENV#@}"; ENV="${ENV%.yml}"                   # normalize: strip leading @ and trailing .yml
 OUT="."
 if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then OUT="$1"; shift; fi
 REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"
@@ -43,8 +43,8 @@ done
 mkdir -p "$OUT"
 
 # ---- genesis helpers ----
-g_dir(){ genesis "$ENV"    b "$@"; }                # bosh -e <env> ...        (director; add -d for redis)
-g_cf(){  genesis "$ENV:cf" b "$@"; }                # bosh -e <env> -d <env>-cf ...  (diego cells)
+g_dir(){ genesis "@$ENV"    b "$@"; }               # genesis @<env> b ...     (director; add -d for redis)
+g_cf(){  genesis "@$ENV:cf" b "$@"; }               # genesis @<env>:cf b ...  (CF / diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
