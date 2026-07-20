@@ -24,29 +24,39 @@
 #   inventory | census --redis <dep> | sweep --cell <inst> | resolve | classify | report   (built stepwise)
 set -uo pipefail
 
-# ---- arg parse: <subcommand> <env> [output-dir] [--redis d] [--cell i] ----
+# ---- arg parse ----
+# orchestrator (on bastion):  <subcommand> <env> [output-dir] [--redis d] [--cell i]
+# worker (scp'd to a host, no <env>):  _worker-census | _worker-sweep
 SUB="${1:-}"; shift || true
 [ -z "$SUB" ] && { echo "usage: $(basename "$0") <subcommand> <env> [output-dir] [--redis <dep>] [--cell <group/idx>]"; exit 1; }
-ENV="${1:-}"; shift || true
-[ -z "$ENV" ] && { echo "ERROR: <env> is required"; exit 1; }
-ENV="${ENV#@}"; ENV="${ENV%.yml}"                   # normalize: strip leading @ and trailing .yml
-OUT="."
-if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then OUT="$1"; shift; fi
-REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"
-while [ "${1:-}" ]; do
-  case "$1" in
-    --redis) REDIS_DEP="${2:-}"; shift 2 ;;
-    --cell)  CELL_INSTANCE="${2:-}"; shift 2 ;;
-    *) echo "ERROR: unknown arg '$1'"; exit 1 ;;
-  esac
-done
-mkdir -p "$OUT"
+ENV=""; OUT="."; REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"; SELF=""
+case "$SUB" in
+  _worker-*) : ;;                                   # workers run on-host; no <env>/flags
+  *)
+    ENV="${1:-}"; shift || true
+    [ -z "$ENV" ] && { echo "ERROR: <env> is required"; exit 1; }
+    ENV="${ENV#@}"; ENV="${ENV%.yml}"               # normalize: strip leading @ and trailing .yml
+    if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then OUT="$1"; shift; fi
+    while [ "${1:-}" ]; do
+      case "$1" in
+        --redis) REDIS_DEP="${2:-}"; shift 2 ;;
+        --cell)  CELL_INSTANCE="${2:-}"; shift 2 ;;
+        *) echo "ERROR: unknown arg '$1'"; exit 1 ;;
+      esac
+    done
+    mkdir -p "$OUT"
+    SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    ;;
+esac
 
 # ---- genesis helpers ----
 g_dir(){ genesis "@$ENV"    b "$@"; }               # genesis @<env> b ...     (director; add -d for redis)
 g_cf(){  genesis "@$ENV:cf" b "$@"; }               # genesis @<env>:cf b ...  (CF / diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
+# group/uuid instance slug of a deployment (ignores the 'Using ... https://' banner)
+dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
+  | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
 
 # ---------------------------------------------------------------- preflight ---
 # NOTE: remote commands run via `... ssh <inst> -c '<cmd>'` MUST avoid double-quotes
@@ -112,13 +122,50 @@ cmd_preflight(){
 }
 
 # ------------------------------------------------- stages (built stepwise) ---
-cmd_inventory(){ die "inventory: implemented in the next step (after preflight passes)"; }
-cmd_census(){    die "census: implemented after inventory is verified"; }
+cmd_inventory(){ die "inventory: implemented in a later step"; }
+
+# census: list live client connections to a redis deployment -> $OUT/02_conns.tsv
+# scp's this script to the redis VM and runs _worker-census there (read-only ss).
+cmd_census(){
+  [ -z "$REDIS_DEP" ] && die "census requires --redis <dep>"
+  local slug; slug=$(dep_slug "$REDIS_DEP")
+  [ -z "$slug" ] && die "could not parse instance slug for '$REDIS_DEP' (run: genesis @$ENV b -d $REDIS_DEP instances)"
+  g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || die "scp worker to $slug failed"
+  local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' 2>/dev/null)
+
+  local f="$OUT/02_conns.tsv"
+  [ -s "$f" ] || printf 'env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port\n' > "$f"
+  local n=0 rip rport pip pport
+  while IFS=$'\t' read -r rip rport pip pport; do
+    [ -z "$rip" ] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$REDIS_DEP" "$rip" "$rport" "$pip" "$pport" >> "$f"
+    n=$((n+1))
+  done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+
+  echo "census: $REDIS_DEP -> $n live connection(s)  (appended to $f)"
+  printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2- | sed 's/^/  redis_ip=/;s/\t/ port=/;s/\t/ peer=/;s/\t/:/'
+}
+
 cmd_sweep(){     die "sweep: implemented after census is verified"; }
 cmd_resolve(){   die "resolve: implemented after sweep is verified"; }
 cmd_classify(){  die "classify: implemented after resolve is verified"; }
 cmd_report(){    die "report: implemented last"; }
-_worker_census(){ die "_worker-census: implemented with census"; }
+
+# _worker-census: RUNS ON the redis VM as root. Read-only. Emits #RCD#-tagged TSV:
+#   #RCD# <redis_ip> <redis_port> <peer_ip> <peer_port>
+# Kernel ss (immune to rename-command hardening). Finds the real port(s) incl TLS.
+_worker_census(){
+  local ports p
+  ports=$(ss -Htnlp 2>/dev/null | grep -iE 'redis|valkey' | grep -oE ':[0-9]+' | tr -d ':' | sort -un)
+  [ -z "$ports" ] && ports=$(grep -REhoE '^(port|tls-port) +[0-9]+' /var/vcap/jobs/*/config/* 2>/dev/null | grep -oE '[0-9]+$' | sort -un)
+  for p in $ports; do
+    [ "$p" = 0 ] && continue
+    ss -Htn state established "sport = :$p" 2>/dev/null | awk -v p="$p" '
+      NF>=2 { loc=$(NF-1); peer=$NF; li=index(loc,":"); pi=index(peer,":");
+              if (li>0 && pi>0)
+                printf "#RCD#\t%s\t%s\t%s\t%s\n", substr(loc,1,li-1), p, substr(peer,1,pi-1), substr(peer,pi+1) }'
+  done
+}
 _worker_sweep(){  die "_worker-sweep: implemented with sweep"; }
 
 # ------------------------------------------------------------------ dispatch --
