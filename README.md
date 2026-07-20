@@ -18,8 +18,22 @@ have no CF binding, env var, or manifest reference — the ones config-side scan
 ## Usage
 
 ```
-ENV=<genesis-env> CELL_DEP=<cf-deployment> CFDOT_CMD='<cfdot actual-lrps cmd>' \
-  ./redis-consumer-discovery.sh preflight [redis_dep]
+redis-consumer-discovery.sh <subcommand> <env> [output-dir] [--redis <dep>] [--cell <group/idx>]
+```
+
+`<env>` is the genesis env name (a trailing `.yml` is stripped). `[output-dir]` defaults to
+the current directory. Deployment names are not hardcoded; genesis targets them:
+
+```
+genesis <env>    b <args>   == bosh -e <env>             <args>   # director level; redis via -d
+genesis <env>:cf b <args>   == bosh -e <env> -d <env>-cf <args>   # CF / diego cells
+```
+
+Preflight:
+
+```
+redis-consumer-discovery.sh preflight <env>                       # discover redis deps + cell group
+redis-consumer-discovery.sh preflight <env> --redis <redis-dep>   # run primitive checks
 ```
 
 Subcommands (built and verified one at a time):

@@ -7,71 +7,86 @@
 # that have NO cf binding / env / manifest (invisible to config scans).
 #
 # READ-ONLY everywhere: ss without -K, cf curl GETs, cfdot reads. Run from the
-# bastion. The SAME file also runs as the on-host worker (it scp's itself to the
-# redis VM / cell and invokes a _worker-* subcommand there).
+# bastion. The SAME file also runs as the on-host worker (scp'd to redis VM/cell).
 #
 # Usage:
-#   redis-consumer-discovery.sh preflight [redis_dep]
-#   redis-consumer-discovery.sh inventory                 (next step)
-#   redis-consumer-discovery.sh census   <redis_dep>      (later)
-#   redis-consumer-discovery.sh sweep    <cell>           (later)
-#   redis-consumer-discovery.sh resolve | classify | report
+#   redis-consumer-discovery.sh <subcommand> <env> [output-dir] [flags]
 #
-# Config via env vars (override the defaults):
-#   ENV=<genesis env>  CELL_DEP=<cf deployment>  CELL_INSTANCE=<group/idx>
-#   CFDOT_CMD='<exact cfdot actual-lrps command that works on a cell>'
-#   OUT=<dir for intermediate files on the bastion>
+#   <env>         genesis env name; a trailing ".yml" is stripped.
+#   [output-dir]  where intermediate/output files go; default = current dir.
+#
+# genesis access model (do NOT hardcode deployment names):
+#   genesis <env>    b <args>   == bosh -e <env>            <args>   (director level; redis via -d)
+#   genesis <env>:cf b <args>   == bosh -e <env> -d <env>-cf <args>  (CF / diego cells)
+#
+# Subcommands:
+#   preflight <env> [out] [--redis <dep>] [--cell <group/idx>]
+#   inventory | census --redis <dep> | sweep --cell <inst> | resolve | classify | report   (built stepwise)
 set -uo pipefail
 
-ENV="${ENV:-sbx}"
-CELL_DEP="${CELL_DEP:-cf}"
-CELL_INSTANCE="${CELL_INSTANCE:-diego-cell/0}"
-CFDOT_CMD="${CFDOT_CMD:-sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps}"
-OUT="${OUT:-./out}"
+# ---- arg parse: <subcommand> <env> [output-dir] [--redis d] [--cell i] ----
+SUB="${1:-}"; shift || true
+[ -z "$SUB" ] && { echo "usage: $(basename "$0") <subcommand> <env> [output-dir] [--redis <dep>] [--cell <group/idx>]"; exit 1; }
+ENV="${1:-}"; shift || true
+[ -z "$ENV" ] && { echo "ERROR: <env> is required"; exit 1; }
+ENV="${ENV%.yml}"                                   # strip a trailing .yml
+OUT="."
+if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then OUT="$1"; shift; fi
+REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"
+while [ "${1:-}" ]; do
+  case "$1" in
+    --redis) REDIS_DEP="${2:-}"; shift 2 ;;
+    --cell)  CELL_INSTANCE="${2:-}"; shift 2 ;;
+    *) echo "ERROR: unknown arg '$1'"; exit 1 ;;
+  esac
+done
+mkdir -p "$OUT"
 
-g(){ genesis "$ENV" b "$@"; }          # genesis <env> b ...  (passthrough to bosh)
+# ---- genesis helpers ----
+g_dir(){ genesis "$ENV"    b "$@"; }                # bosh -e <env> ...        (director; add -d for redis)
+g_cf(){  genesis "$ENV:cf" b "$@"; }                # bosh -e <env> -d <env>-cf ...  (diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- preflight ---
 cmd_preflight(){
-  local REDIS_DEP="${1:-${REDIS_DEP:-}}"
+  echo "env=$ENV  output=$OUT"
 
-  line "0.a  discover redis deployments  (pick one -> REDIS_DEP)"
-  g deployments 2>/dev/null | grep -iE 'redis|valkey' | head
+  line "0.a  discover redis deployments  (pick one -> --redis)"
+  g_dir deployments 2>/dev/null | grep -iE 'redis|valkey' | head
 
   line "0.b  discover the diego-cell instance group name"
-  g -d "$CELL_DEP" vms 2>/dev/null | grep -iE 'diego|cell|compute' | head
+  g_cf vms 2>/dev/null | grep -iE 'diego|cell|compute' | head
 
   if [ -z "$REDIS_DEP" ]; then
-    echo; echo ">> re-run as: preflight <redis_dep>   to run the primitive checks"; return 0
+    echo; echo ">> re-run with:  preflight $ENV --redis <redis-dep>   for the primitive checks"; return 0
   fi
 
   line "0.1  non-interactive ssh + captured stdout (redis)"
-  g -d "$REDIS_DEP" ssh redis/0 -c 'echo HOST=$(hostname); echo WHOAMI=$(id -un)'
+  g_dir -d "$REDIS_DEP" ssh redis/0 -c 'echo HOST=$(hostname); echo WHOAMI=$(id -un)'
 
   line "0.2  passwordless sudo on the redis VM"
-  g -d "$REDIS_DEP" ssh redis/0 -c 'sudo id | grep -o "uid=0(root)" && echo SUDO_OK'
+  g_dir -d "$REDIS_DEP" ssh redis/0 -c 'sudo id | grep -o "uid=0(root)" && echo SUDO_OK'
 
   line "0.3  scp round-trip (bastion -> VM -> bastion)"
-  local ts; ts=$(date +%s); echo "ping $ts" > /tmp/pf_test.txt
-  g -d "$REDIS_DEP" scp /tmp/pf_test.txt redis/0:/var/vcap/data/pf_test.txt >/dev/null 2>&1
-  g -d "$REDIS_DEP" ssh redis/0 -c 'cat /var/vcap/data/pf_test.txt'
-  g -d "$REDIS_DEP" scp redis/0:/var/vcap/data/pf_test.txt /tmp/pf_back.txt >/dev/null 2>&1
-  diff -q /tmp/pf_test.txt /tmp/pf_back.txt >/dev/null && echo SCP_ROUNDTRIP_OK || echo SCP_FAIL
+  local ts; ts=$(date +%s); echo "ping $ts" > "$OUT/pf_test.txt"
+  g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" redis/0:/var/vcap/data/pf_test.txt >/dev/null 2>&1
+  g_dir -d "$REDIS_DEP" ssh redis/0 -c 'cat /var/vcap/data/pf_test.txt'
+  g_dir -d "$REDIS_DEP" scp redis/0:/var/vcap/data/pf_test.txt "$OUT/pf_back.txt" >/dev/null 2>&1
+  diff -q "$OUT/pf_test.txt" "$OUT/pf_back.txt" >/dev/null && echo SCP_ROUNDTRIP_OK || echo SCP_FAIL
 
   line "0.4  cell reachable + tools present (nsenter/lsns/ss)"
-  g -d "$CELL_DEP" ssh "$CELL_INSTANCE" -c 'sudo id | grep -o "uid=0(root)"; for t in nsenter lsns ss; do printf "%s=" "$t"; command -v $t || echo MISSING; done'
+  g_cf ssh "$CELL_INSTANCE" -c 'sudo id | grep -o "uid=0(root)"; for t in nsenter lsns ss; do printf "%s=" "$t"; command -v $t || echo MISSING; done'
 
   line "0.5  cfdot works from a cell and returns JSON (sample)"
-  g -d "$CELL_DEP" ssh "$CELL_INSTANCE" -c "$CFDOT_CMD 2>&1 | head -c 300"
+  g_cf ssh "$CELL_INSTANCE" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps 2>&1 | head -c 300'
 
   line "0.6  cf API reachable from bastion + jq present"
   command -v jq >/dev/null && echo "jq=$(jq --version)" || echo jq=MISSING
   cf api 2>/dev/null | head -1
   cf curl /v3/apps?per_page=1 2>/dev/null | jq '.pagination.total_results' 2>/dev/null
 
-  echo; echo ">> report PASS/FAIL per check + the 3 discovered values"
+  echo; echo ">> report PASS/FAIL per check + the redis-dep and cell-group values"
 }
 
 # ------------------------------------------------- stages (built stepwise) ---
@@ -81,22 +96,19 @@ cmd_sweep(){     die "sweep: implemented after census is verified"; }
 cmd_resolve(){   die "resolve: implemented after sweep is verified"; }
 cmd_classify(){  die "classify: implemented after resolve is verified"; }
 cmd_report(){    die "report: implemented last"; }
-
-# on-host workers (scp'd, run with sudo on the target) --------------------------
 _worker_census(){ die "_worker-census: implemented with census"; }
 _worker_sweep(){  die "_worker-sweep: implemented with sweep"; }
 
 # ------------------------------------------------------------------ dispatch --
-sub="${1:-}"; shift || true
-case "$sub" in
-  preflight)       cmd_preflight "$@" ;;
-  inventory)       cmd_inventory "$@" ;;
-  census)          cmd_census    "$@" ;;
-  sweep)           cmd_sweep     "$@" ;;
-  resolve)         cmd_resolve   "$@" ;;
-  classify)        cmd_classify  "$@" ;;
-  report)          cmd_report    "$@" ;;
-  _worker-census)  _worker_census "$@" ;;
-  _worker-sweep)   _worker_sweep  "$@" ;;
-  *) echo "usage: $(basename "$0") {preflight [redis_dep]|inventory|census <dep>|sweep <cell>|resolve|classify|report}"; exit 1 ;;
+case "$SUB" in
+  preflight)       cmd_preflight ;;
+  inventory)       cmd_inventory ;;
+  census)          cmd_census ;;
+  sweep)           cmd_sweep ;;
+  resolve)         cmd_resolve ;;
+  classify)        cmd_classify ;;
+  report)          cmd_report ;;
+  _worker-census)  _worker_census ;;
+  _worker-sweep)   _worker_sweep ;;
+  *) echo "ERROR: unknown subcommand '$SUB'"; exit 1 ;;
 esac
