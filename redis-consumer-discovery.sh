@@ -49,6 +49,9 @@ line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- preflight ---
+# NOTE: remote commands run via `... ssh <inst> -c '<cmd>'` MUST avoid double-quotes
+# and parentheses -- they do not survive the genesis->bosh->ssh layering (the remote
+# shell sees a bare '('). Keep remote commands to simple tokens, pipes, ; and redirects.
 cmd_preflight(){
   echo "env=$ENV  output=$OUT"
 
@@ -62,31 +65,38 @@ cmd_preflight(){
     echo; echo ">> re-run with:  preflight $ENV --redis <redis-dep>   for the primitive checks"; return 0
   fi
 
-  line "0.1  non-interactive ssh + captured stdout (redis)"
-  g_dir -d "$REDIS_DEP" ssh redis/0 -c 'echo HOST=$(hostname); echo WHOAMI=$(id -un)'
+  line "0.0  discover the redis instance slug in $REDIS_DEP"
+  local RI
+  RI=$(g_dir -d "$REDIS_DEP" instances --column=Instance 2>/dev/null | grep -E '/' | head -1 | awk '{print $1}')
+  [ -z "$RI" ] && RI=$(g_dir -d "$REDIS_DEP" vms 2>/dev/null | grep -oE '[a-z][a-z0-9_-]+/[a-z0-9-]+' | head -1)
+  [ -z "$RI" ] && { echo "could not find redis instance; run:  genesis @$ENV b -d $REDIS_DEP instances"; return 1; }
+  echo "redis instance = $RI"
 
-  line "0.2  passwordless sudo on the redis VM"
-  g_dir -d "$REDIS_DEP" ssh redis/0 -c 'sudo id | grep -o "uid=0(root)" && echo SUDO_OK'
+  line "0.1  non-interactive ssh + captured stdout (redis)"
+  g_dir -d "$REDIS_DEP" ssh "$RI" -c 'hostname; id -un'
+
+  line "0.2  passwordless sudo on the redis VM (expect: root)"
+  g_dir -d "$REDIS_DEP" ssh "$RI" -c 'sudo whoami'
 
   line "0.3  scp round-trip (bastion -> VM -> bastion)"
   local ts; ts=$(date +%s); echo "ping $ts" > "$OUT/pf_test.txt"
-  g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" redis/0:/var/vcap/data/pf_test.txt >/dev/null 2>&1
-  g_dir -d "$REDIS_DEP" ssh redis/0 -c 'cat /var/vcap/data/pf_test.txt'
-  g_dir -d "$REDIS_DEP" scp redis/0:/var/vcap/data/pf_test.txt "$OUT/pf_back.txt" >/dev/null 2>&1
+  g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" "$RI":/var/vcap/data/pf_test.txt >/dev/null 2>&1
+  g_dir -d "$REDIS_DEP" ssh "$RI" -c 'cat /var/vcap/data/pf_test.txt'
+  g_dir -d "$REDIS_DEP" scp "$RI":/var/vcap/data/pf_test.txt "$OUT/pf_back.txt" >/dev/null 2>&1
   diff -q "$OUT/pf_test.txt" "$OUT/pf_back.txt" >/dev/null && echo SCP_ROUNDTRIP_OK || echo SCP_FAIL
 
-  line "0.4  cell reachable + tools present (nsenter/lsns/ss)"
-  g_cf ssh "$CELL_INSTANCE" -c 'sudo id | grep -o "uid=0(root)"; for t in nsenter lsns ss; do printf "%s=" "$t"; command -v $t || echo MISSING; done'
+  line "0.4  cell reachable + tools (expect: root, then 3 paths)"
+  g_cf ssh "$CELL_INSTANCE" -c 'sudo whoami; command -v nsenter; command -v lsns; command -v ss'
 
   line "0.5  cfdot works from a cell and returns JSON (sample)"
   g_cf ssh "$CELL_INSTANCE" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps 2>&1 | head -c 300'
 
-  line "0.6  cf API reachable from bastion + jq present"
-  command -v jq >/dev/null && echo "jq=$(jq --version)" || echo jq=MISSING
-  cf api 2>/dev/null | head -1
-  cf curl /v3/apps?per_page=1 2>/dev/null | jq '.pagination.total_results' 2>/dev/null
+  line "0.6  cf API + jq (bastion; non-interactive, hard timeout)"
+  command -v jq >/dev/null && echo "jq=$(jq --version)" || echo "jq=MISSING"
+  cf target 2>&1 | grep -iE 'api endpoint|user|org|not logged' | head -4
+  timeout 20 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq '.pagination.total_results' 2>/dev/null
 
-  echo; echo ">> report PASS/FAIL per check + the redis-dep and cell-group values"
+  echo; echo ">> report PASS/FAIL per check + the redis instance/dep and cell group"
 }
 
 # ------------------------------------------------- stages (built stepwise) ---
