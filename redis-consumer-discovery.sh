@@ -80,12 +80,12 @@ cmd_preflight(){
   line "0.2  passwordless sudo on the redis VM (expect: root)"
   g_dir -d "$REDIS_DEP" ssh -c 'sudo whoami'
 
-  line "0.3  scp round-trip (bastion -> VM -> bastion)"
+  line "0.3  scp round-trip (bastion -> VM:/tmp -> bastion)"
   if [ -n "$RI" ]; then
     local ts; ts=$(date +%s); echo "ping $ts" > "$OUT/pf_test.txt"
-    g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" "$RI":/var/vcap/data/pf_test.txt >/dev/null 2>&1
-    g_dir -d "$REDIS_DEP" ssh -c 'cat /var/vcap/data/pf_test.txt'
-    g_dir -d "$REDIS_DEP" scp "$RI":/var/vcap/data/pf_test.txt "$OUT/pf_back.txt" >/dev/null 2>&1
+    g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" "$RI":/tmp/pf_test.txt || echo "(upload scp errored)"
+    g_dir -d "$REDIS_DEP" ssh -c 'cat /tmp/pf_test.txt'
+    g_dir -d "$REDIS_DEP" scp "$RI":/tmp/pf_test.txt "$OUT/pf_back.txt" || echo "(download scp errored)"
     diff -q "$OUT/pf_test.txt" "$OUT/pf_back.txt" >/dev/null && echo SCP_ROUNDTRIP_OK || echo SCP_FAIL
   else
     echo "SCP_SKIPPED (no slug parsed); paste output of:  genesis @$ENV b -d $REDIS_DEP instances"
@@ -98,9 +98,15 @@ cmd_preflight(){
   g_cf ssh "$CELL_INSTANCE" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps 2>&1 | head -c 300'
 
   line "0.6  cf API + jq (bastion; non-interactive, hard timeout)"
-  command -v jq >/dev/null && echo "jq=$(jq --version)" || echo "jq=MISSING"
-  cf target 2>&1 | grep -iE 'api endpoint|user|org|not logged' | head -4
-  timeout 20 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq '.pagination.total_results' 2>/dev/null
+  if command -v jq >/dev/null; then echo "jq=OK $(jq --version)"; else echo "jq=MISSING"; fi
+  if cf target >/dev/null 2>&1; then
+    echo "cf-login=OK"; cf target 2>/dev/null | grep -iE 'api endpoint|user'
+  else
+    echo "cf-login=FAIL (run: cf login / cf target)"
+  fi
+  local n; n=$(timeout 20 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq -r '.pagination.total_results // "ERR"' 2>/dev/null)
+  echo "apps-total=${n:-ERR}"
+  { [ -n "$n" ] && [ "$n" != "ERR" ]; } && echo CF_API_OK || echo CF_API_FAIL
 
   echo; echo ">> report PASS/FAIL per check + the redis instance/dep and cell group"
 }
