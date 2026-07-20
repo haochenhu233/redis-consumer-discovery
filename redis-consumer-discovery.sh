@@ -65,25 +65,31 @@ cmd_preflight(){
     echo; echo ">> re-run with:  preflight $ENV --redis <redis-dep>   for the primitive checks"; return 0
   fi
 
-  line "0.0  discover the redis instance slug in $REDIS_DEP"
+  # standalone redis = 1 VM, so ssh targets the deployment directly (no instance slug).
+  # scp DOES need an instance target -> parse a real UUID slug (group/xxxxxxxx-xxxx-...),
+  # which can't match the 'Using environment https://...' banner or an IP.
+  line "0.0  redis instance slug (only needed for scp)"
   local RI
-  RI=$(g_dir -d "$REDIS_DEP" instances --column=Instance 2>/dev/null | grep -E '/' | head -1 | awk '{print $1}')
-  [ -z "$RI" ] && RI=$(g_dir -d "$REDIS_DEP" vms 2>/dev/null | grep -oE '[a-z][a-z0-9_-]+/[a-z0-9-]+' | head -1)
-  [ -z "$RI" ] && { echo "could not find redis instance; run:  genesis @$ENV b -d $REDIS_DEP instances"; return 1; }
-  echo "redis instance = $RI"
+  RI=$(g_dir -d "$REDIS_DEP" instances 2>/dev/null \
+        | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+  echo "redis instance = ${RI:-<not parsed - ssh still works via -d>}"
 
-  line "0.1  non-interactive ssh + captured stdout (redis)"
-  g_dir -d "$REDIS_DEP" ssh "$RI" -c 'hostname; id -un'
+  line "0.1  non-interactive ssh + captured stdout (redis; note the instance header)"
+  g_dir -d "$REDIS_DEP" ssh -c 'hostname; id -un'
 
   line "0.2  passwordless sudo on the redis VM (expect: root)"
-  g_dir -d "$REDIS_DEP" ssh "$RI" -c 'sudo whoami'
+  g_dir -d "$REDIS_DEP" ssh -c 'sudo whoami'
 
   line "0.3  scp round-trip (bastion -> VM -> bastion)"
-  local ts; ts=$(date +%s); echo "ping $ts" > "$OUT/pf_test.txt"
-  g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" "$RI":/var/vcap/data/pf_test.txt >/dev/null 2>&1
-  g_dir -d "$REDIS_DEP" ssh "$RI" -c 'cat /var/vcap/data/pf_test.txt'
-  g_dir -d "$REDIS_DEP" scp "$RI":/var/vcap/data/pf_test.txt "$OUT/pf_back.txt" >/dev/null 2>&1
-  diff -q "$OUT/pf_test.txt" "$OUT/pf_back.txt" >/dev/null && echo SCP_ROUNDTRIP_OK || echo SCP_FAIL
+  if [ -n "$RI" ]; then
+    local ts; ts=$(date +%s); echo "ping $ts" > "$OUT/pf_test.txt"
+    g_dir -d "$REDIS_DEP" scp "$OUT/pf_test.txt" "$RI":/var/vcap/data/pf_test.txt >/dev/null 2>&1
+    g_dir -d "$REDIS_DEP" ssh -c 'cat /var/vcap/data/pf_test.txt'
+    g_dir -d "$REDIS_DEP" scp "$RI":/var/vcap/data/pf_test.txt "$OUT/pf_back.txt" >/dev/null 2>&1
+    diff -q "$OUT/pf_test.txt" "$OUT/pf_back.txt" >/dev/null && echo SCP_ROUNDTRIP_OK || echo SCP_FAIL
+  else
+    echo "SCP_SKIPPED (no slug parsed); paste output of:  genesis @$ENV b -d $REDIS_DEP instances"
+  fi
 
   line "0.4  cell reachable + tools (expect: root, then 3 paths)"
   g_cf ssh "$CELL_INSTANCE" -c 'sudo whoami; command -v nsenter; command -v lsns; command -v ss'
