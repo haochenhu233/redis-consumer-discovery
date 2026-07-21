@@ -192,9 +192,14 @@ cmd_resolve(){
   local cell; cell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
   [ -z "$cell" ] && die "no cell_instance in $cm"
   echo "resolve: dumping cfdot actual-lrps from $cell ..."
-  g_cf ssh "$cell" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps > /tmp/rcd_lrps.json 2>/dev/null; wc -c < /tmp/rcd_lrps.json' >/dev/null 2>&1
+  # remote command uses ONLY shell-safe tokens (no parens/double-quotes/$()) per genesis-ssh constraint
+  echo "--- cfdot dump diagnostics (bytes + first stderr lines) ---"
+  g_cf ssh "$cell" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps > /tmp/rcd_lrps.json 2>/tmp/rcd_lrps.err; wc -c /tmp/rcd_lrps.json; echo --STDERR--; head -3 /tmp/rcd_lrps.err'
+  echo "----------------------------------------------------------"
   g_cf scp "$cell":/tmp/rcd_lrps.json "$OUT/04_lrps.json" >/dev/null 2>&1 || die "scp cfdot dump failed"
-  [ -s "$OUT/04_lrps.json" ] || die "cfdot dump empty ($OUT/04_lrps.json)"
+  if [ ! -s "$OUT/04_lrps.json" ]; then
+    die "cfdot dump empty. See --STDERR-- above; try the exact cfdot command you used manually and tell me its form (path/subcommand/flags)."
+  fi
 
   # 2) normalize LRPs -> ig<TAB>pg<TAB>instance_address  (format-agnostic)
   jq -rc '.. | objects | select(has("instance_guid") and has("process_guid"))
