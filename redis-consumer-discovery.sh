@@ -54,6 +54,8 @@ g_dir(){ genesis "@$ENV"    b "$@"; }               # genesis @<env> b ...     (
 g_cf(){  genesis "@$ENV:cf" b "$@"; }               # genesis @<env>:cf b ...  (CF / diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
+# cfdot is on the sudo user's PATH; override with CFDOT=... if it differs per foundation.
+CFDOT="${CFDOT:-cfdot}"
 # group/uuid instance slug of a deployment (ignores the 'Using ... https://' banner)
 dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
   | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
@@ -107,8 +109,8 @@ cmd_preflight(){
   line "0.4  cell reachable + tools (expect: root, then 3 paths)"
   g_cf ssh "$CELL_INSTANCE" -c 'sudo whoami; command -v nsenter; command -v lsns; command -v ss'
 
-  line "0.5  cfdot works from a cell and returns JSON (sample)"
-  g_cf ssh "$CELL_INSTANCE" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps 2>&1 | head -c 300'
+  line "0.5  cfdot works from a cell and returns actual-lrps JSON"
+  g_cf ssh "$CELL_INSTANCE" -c "sudo $CFDOT actual-lrps > /tmp/rcd_pf.json 2>/tmp/rcd_pf.err; wc -c /tmp/rcd_pf.json; echo --STDERR--; head -2 /tmp/rcd_pf.err; echo --SAMPLE--; head -c 200 /tmp/rcd_pf.json"
 
   line "0.6  cf API + jq (bastion; non-interactive, hard timeout)"
   if command -v jq >/dev/null; then echo "jq=OK $(jq --version)"; else echo "jq=MISSING"; fi
@@ -194,7 +196,7 @@ cmd_resolve(){
   echo "resolve: dumping cfdot actual-lrps from $cell ..."
   # remote command uses ONLY shell-safe tokens (no parens/double-quotes/$()) per genesis-ssh constraint
   echo "--- cfdot dump diagnostics (bytes + first stderr lines) ---"
-  g_cf ssh "$cell" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps > /tmp/rcd_lrps.json 2>/tmp/rcd_lrps.err; wc -c /tmp/rcd_lrps.json; echo --STDERR--; head -3 /tmp/rcd_lrps.err'
+  g_cf ssh "$cell" -c "sudo $CFDOT actual-lrps > /tmp/rcd_lrps.json 2>/tmp/rcd_lrps.err; wc -c /tmp/rcd_lrps.json; echo --STDERR--; head -3 /tmp/rcd_lrps.err"
   echo "----------------------------------------------------------"
   g_cf scp "$cell":/tmp/rcd_lrps.json "$OUT/04_lrps.json" >/dev/null 2>&1 || die "scp cfdot dump failed"
   if [ ! -s "$OUT/04_lrps.json" ]; then
