@@ -57,6 +57,9 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 # group/uuid instance slug of a deployment (ignores the 'Using ... https://' banner)
 dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
   | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
+# cell instance slug (group/uuid) for a given cell IP, from the CF deployment vms
+cell_slug_for_ip(){ g_cf vms 2>/dev/null | grep -F "$1" \
+  | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
 
 # ---------------------------------------------------------------- preflight ---
 # NOTE: remote commands run via `... ssh <inst> -c '<cmd>'` MUST avoid double-quotes
@@ -146,7 +149,36 @@ cmd_census(){
   printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2- | sed 's/^/  redis_ip=/;s/\t/ port=/;s/\t/ peer=/;s/\t/:/'
 }
 
-cmd_sweep(){     die "sweep: implemented after census is verified"; }
+# sweep: for each cell in 02_conns.tsv, resolve its containers' connections to redis
+# into (container_ip, CF_INSTANCE_GUID) -> $OUT/03_cellmap.tsv
+cmd_sweep(){
+  local conns="$OUT/02_conns.tsv"
+  [ -s "$conns" ] || die "no census file at $conns; run census first"
+  local redis_ips cell_ips
+  redis_ips=$(awk -F'\t' 'NR>1{print $3}' "$conns" | sort -u | tr '\n' ' ')
+  cell_ips=$(awk -F'\t' 'NR>1{print $5}' "$conns" | sort -u)
+  [ -z "${redis_ips// /}" ] && die "no redis IPs in $conns"
+
+  local f="$OUT/03_cellmap.tsv"
+  [ -s "$f" ] || printf 'env\tcell_ip\tcell_instance\tcontainer_ip\tinstance_guid\tredis_ip\n' > "$f"
+
+  local cip cslug raw n ccip guid rip
+  for cip in $cell_ips; do
+    cslug=$(cell_slug_for_ip "$cip")
+    [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; continue; }
+    g_cf scp "$SELF" "$cslug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "sweep: scp to $cslug failed"; continue; }
+    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $redis_ips" 2>/dev/null)
+    n=0
+    while IFS=$'\t' read -r ccip guid rip; do
+      [ -z "$ccip" ] && continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$cip" "$cslug" "$ccip" "$guid" "$rip" >> "$f"
+      n=$((n+1))
+    done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+    echo "sweep: cell $cip ($cslug) -> $n container(s)"
+  done
+  echo "sweep: results in $f"; column -t -s$'\t' "$f" 2>/dev/null || cat "$f"
+}
+
 cmd_resolve(){   die "resolve: implemented after sweep is verified"; }
 cmd_classify(){  die "classify: implemented after resolve is verified"; }
 cmd_report(){    die "report: implemented last"; }
@@ -166,7 +198,40 @@ _worker_census(){
                 printf "#RCD#\t%s\t%s\t%s\t%s\n", substr(loc,1,li-1), p, substr(peer,1,pi-1), substr(peer,pi+1) }'
   done
 }
-_worker_sweep(){  die "_worker-sweep: implemented with sweep"; }
+# _worker-sweep <redis_ip...>: RUNS ON a diego cell as root. Read-only.
+# For each network namespace with an established connection to a redis IP, emits:
+#   #RCD# <container_ip> <instance_guid> <redis_ip>
+# instance_guid = CF_INSTANCE_GUID from a process in that netns (NOGUID if scrubbed;
+# container_ip is the backup join key).
+_worker_sweep(){
+  local redis_ips="$*"
+  declare -A seen
+  local nsfile pid ino hits guid q qino qpid
+  for nsfile in /proc/[0-9]*/ns/net; do
+    pid=${nsfile#/proc/}; pid=${pid%/ns/net}
+    ino=$(readlink "$nsfile" 2>/dev/null) || continue
+    [ -n "${seen[$ino]:-}" ] && continue
+    seen[$ino]=$pid
+    hits=$(nsenter -t "$pid" -n ss -Htn state established 2>/dev/null | awk -v ips="$redis_ips" '
+      BEGIN{ n=split(ips,a," "); for(i=1;i<=n;i++) R[a[i]]=1 }
+      NF>=2 { loc=$(NF-1); peer=$NF; pi=index(peer,":"); pip=substr(peer,1,pi-1);
+              if (pip in R) { li=index(loc,":"); print substr(loc,1,li-1) "\t" pip } }' | sort -u)
+    [ -z "$hits" ] && continue
+    guid=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | sed -n 's/^CF_INSTANCE_GUID=//p' | head -1)
+    if [ -z "$guid" ]; then
+      for q in /proc/[0-9]*/ns/net; do
+        qino=$(readlink "$q" 2>/dev/null) || continue
+        [ "$qino" = "$ino" ] || continue
+        qpid=${q#/proc/}; qpid=${qpid%/ns/net}
+        guid=$(tr '\0' '\n' < /proc/$qpid/environ 2>/dev/null | sed -n 's/^CF_INSTANCE_GUID=//p' | head -1)
+        [ -n "$guid" ] && break
+      done
+    fi
+    printf '%s\n' "$hits" | while IFS=$'\t' read -r cip rip; do
+      printf '#RCD#\t%s\t%s\t%s\n' "$cip" "${guid:-NOGUID}" "$rip"
+    done
+  done
+}
 
 # ------------------------------------------------------------------ dispatch --
 case "$SUB" in
