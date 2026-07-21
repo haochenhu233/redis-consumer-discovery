@@ -54,7 +54,10 @@ g_dir(){ genesis "@$ENV"    b "$@"; }               # genesis @<env> b ...     (
 g_cf(){  genesis "@$ENV:cf" b "$@"; }               # genesis @<env>:cf b ...  (CF / diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
-# cfdot is on the sudo user's PATH; override with CFDOT=... if it differs per foundation.
+# cfdot is provisioned via the diego LOGIN profile (adds it to PATH + exports BBS certs/env).
+# A non-interactive `sudo cfdot` runs with secure_path and no profile -> "command not found".
+# So cfdot always runs through the scp'd worker via a login shell (bash -lc). Override the
+# command with CFDOT=... if a foundation names it differently.
 CFDOT="${CFDOT:-cfdot}"
 # group/uuid instance slug of a deployment (ignores the 'Using ... https://' banner)
 dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
@@ -109,8 +112,9 @@ cmd_preflight(){
   line "0.4  cell reachable + tools (expect: root, then 3 paths)"
   g_cf ssh "$CELL_INSTANCE" -c 'sudo whoami; command -v nsenter; command -v lsns; command -v ss'
 
-  line "0.5  cfdot works from a cell and returns actual-lrps JSON"
-  g_cf ssh "$CELL_INSTANCE" -c "sudo $CFDOT actual-lrps > /tmp/rcd_pf.json 2>/tmp/rcd_pf.err; wc -c /tmp/rcd_pf.json; echo --STDERR--; head -2 /tmp/rcd_pf.err; echo --SAMPLE--; head -c 200 /tmp/rcd_pf.json"
+  line "0.5  cfdot works from a cell and returns actual-lrps JSON (via login-shell worker)"
+  g_cf scp "$SELF" "$CELL_INSTANCE":/tmp/rcd.sh >/dev/null 2>&1 || echo "(scp worker failed)"
+  g_cf ssh "$CELL_INSTANCE" -c 'sudo bash /tmp/rcd.sh _worker-cfdot > /tmp/rcd_pf.json 2>/tmp/rcd_pf.err; wc -c /tmp/rcd_pf.json; echo --STDERR--; head -2 /tmp/rcd_pf.err; echo --SAMPLE--; head -c 200 /tmp/rcd_pf.json'
 
   line "0.6  cf API + jq (bastion; non-interactive, hard timeout)"
   if command -v jq >/dev/null; then echo "jq=OK $(jq --version)"; else echo "jq=MISSING"; fi
@@ -194,9 +198,9 @@ cmd_resolve(){
   local cell; cell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
   [ -z "$cell" ] && die "no cell_instance in $cm"
   echo "resolve: dumping cfdot actual-lrps from $cell ..."
-  # remote command uses ONLY shell-safe tokens (no parens/double-quotes/$()) per genesis-ssh constraint
+  g_cf scp "$SELF" "$cell":/tmp/rcd.sh >/dev/null 2>&1 || die "scp worker to $cell failed"
   echo "--- cfdot dump diagnostics (bytes + first stderr lines) ---"
-  g_cf ssh "$cell" -c "sudo $CFDOT actual-lrps > /tmp/rcd_lrps.json 2>/tmp/rcd_lrps.err; wc -c /tmp/rcd_lrps.json; echo --STDERR--; head -3 /tmp/rcd_lrps.err"
+  g_cf ssh "$cell" -c 'sudo bash /tmp/rcd.sh _worker-cfdot > /tmp/rcd_lrps.json 2>/tmp/rcd_lrps.err; wc -c /tmp/rcd_lrps.json; echo --STDERR--; head -3 /tmp/rcd_lrps.err'
   echo "----------------------------------------------------------"
   g_cf scp "$cell":/tmp/rcd_lrps.json "$OUT/04_lrps.json" >/dev/null 2>&1 || die "scp cfdot dump failed"
   if [ ! -s "$OUT/04_lrps.json" ]; then
@@ -278,6 +282,15 @@ _worker_census(){
 #   #RCD# <container_ip> <instance_guid> <redis_ip>
 # instance_guid = CF_INSTANCE_GUID from a process in that netns (NOGUID if scrubbed;
 # container_ip is the backup join key).
+# _worker-cfdot: RUNS ON a diego cell. Emits `cfdot actual-lrps` JSON to stdout.
+# Uses a LOGIN shell so the diego cfdot profile (PATH + BBS certs/env) is sourced --
+# this is what makes cfdot resolvable, exactly as in an interactive bosh ssh session.
+_worker_cfdot(){
+  local c="${1:-cfdot}"
+  if command -v "$c" >/dev/null 2>&1; then "$c" actual-lrps; return $?; fi
+  bash -lc "$c actual-lrps"                          # login shell sources /etc/profile.d/*
+}
+
 _worker_sweep(){
   local dbg=""; [ "${1:-}" = DEBUG ] && { dbg=1; shift; }
   local redis_ips="$*"
@@ -339,5 +352,6 @@ case "$SUB" in
   report)          cmd_report ;;
   _worker-census)  _worker_census "$@" ;;
   _worker-sweep)   _worker_sweep "$@" ;;
+  _worker-cfdot)   _worker_cfdot "$@" ;;
   *) echo "ERROR: unknown subcommand '$SUB'"; exit 1 ;;
 esac
