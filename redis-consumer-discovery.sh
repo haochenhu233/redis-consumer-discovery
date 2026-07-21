@@ -181,7 +181,73 @@ cmd_sweep(){
   echo "sweep: results in $f"; column -t -s$'\t' "$f" 2>/dev/null || cat "$f"
 }
 
-cmd_resolve(){   die "resolve: implemented after sweep is verified"; }
+# resolve: instance_guid (+ container_ip fallback) -> app name/org/space -> $OUT/05_apps.tsv
+# Dumps cfdot actual-lrps ONCE from a cell (BBS is global), joins offline, then cf curl.
+cmd_resolve(){
+  local cm="$OUT/03_cellmap.tsv"
+  [ -s "$cm" ] || die "no cellmap at $cm; run sweep first"
+  command -v jq >/dev/null || die "jq required on the bastion"
+
+  # 1) dump cfdot actual-lrps from any cell in the cellmap
+  local cell; cell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
+  [ -z "$cell" ] && die "no cell_instance in $cm"
+  echo "resolve: dumping cfdot actual-lrps from $cell ..."
+  g_cf ssh "$cell" -c 'sudo /var/vcap/jobs/cfdot/bin/cfdot actual-lrps > /tmp/rcd_lrps.json 2>/dev/null; wc -c < /tmp/rcd_lrps.json' >/dev/null 2>&1
+  g_cf scp "$cell":/tmp/rcd_lrps.json "$OUT/04_lrps.json" >/dev/null 2>&1 || die "scp cfdot dump failed"
+  [ -s "$OUT/04_lrps.json" ] || die "cfdot dump empty ($OUT/04_lrps.json)"
+
+  # 2) normalize LRPs -> ig<TAB>pg<TAB>instance_address  (format-agnostic)
+  jq -rc '.. | objects | select(has("instance_guid") and has("process_guid"))
+          | [ .instance_guid, .process_guid, (.instance_address // .address // "") ] | @tsv' \
+     "$OUT/04_lrps.json" > "$OUT/04_lrps.tsv" 2>/dev/null
+  local lrpn; lrpn=$(wc -l < "$OUT/04_lrps.tsv" | tr -d ' ')
+  echo "resolve: parsed $lrpn LRP records"
+  [ "$lrpn" -eq 0 ] && die "parsed 0 LRPs; inspect $OUT/04_lrps.json (unexpected cfdot format)"
+
+  # build lookups: ig->pg and ia->pg
+  declare -A PG_BY_IG PG_BY_IA
+  local ig pg ia
+  while IFS=$'\t' read -r ig pg ia; do
+    [ -n "$ig" ] && PG_BY_IG["$ig"]="$pg"
+    [ -n "$ia" ] && PG_BY_IA["$ia"]="$pg"
+  done < "$OUT/04_lrps.tsv"
+
+  # 3) walk cellmap, resolve each container to an app (cache CF API lookups)
+  local out="$OUT/05_apps.tsv"
+  printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\n' > "$out"
+  declare -A APP_CACHE
+  local e cip guid rip cinst cell_ip
+  while IFS=$'\t' read -r e cell_ip cinst cip guid rip; do
+    [ "$e" = env ] && continue
+    [ -z "$e" ] && continue
+    pg="${PG_BY_IG[$guid]:-}"
+    [ -z "$pg" ] && pg="${PG_BY_IA[$cip]:-}"      # fallback via container IP (NOGUID case)
+    local ag name sp org
+    if [ -n "$pg" ]; then
+      ag="${pg:0:36}"
+      if [ -n "${APP_CACHE[$ag]:-}" ]; then
+        IFS=$'\t' read -r name sp org <<< "${APP_CACHE[$ag]}"
+      else
+        local aj sg
+        aj=$(timeout 20 cf curl "/v3/apps/$ag" 2>/dev/null)
+        name=$(printf '%s' "$aj" | jq -r '.name // "?"' 2>/dev/null)
+        sg=$(printf '%s' "$aj" | jq -r '.relationships.space.data.guid // ""' 2>/dev/null)
+        sp="?"; org="?"
+        if [ -n "$sg" ]; then
+          IFS=$'\t' read -r sp org < <(timeout 20 cf curl "/v3/spaces/$sg?include=organization" 2>/dev/null \
+            | jq -r '[ (.name // "?"), (.included.organizations[0].name // "?") ] | @tsv' 2>/dev/null)
+        fi
+        APP_CACHE[$ag]="$name"$'\t'"$sp"$'\t'"$org"
+      fi
+    else
+      ag="?"; name="UNRESOLVED"; sp="?"; org="?"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$rip" "$cip" "$guid" "${pg:-?}" "$ag" "$name" "$sp" "$org" >> "$out"
+  done < "$cm"
+
+  echo "resolve: results in $out"
+  column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
+}
 cmd_classify(){  die "classify: implemented after resolve is verified"; }
 cmd_report(){    die "report: implemented last"; }
 
