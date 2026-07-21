@@ -259,8 +259,93 @@ cmd_resolve(){
   echo "resolve: results in $out"
   column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
 }
-cmd_classify(){  die "classify: implemented after resolve is verified"; }
-cmd_report(){    die "report: implemented last"; }
+# classify: assign a migration method per resolved app+redis -> $OUT/06_classified.tsv
+#   cf-bind    : app has a binding to THIS redis service instance (auto-migrates)
+#   static-env : redis IP / a REDIS host|url env var present in the app's CF env
+#                (env-var and push-manifest 'env:' are indistinguishable platform-side)
+#   unknown    : connects, but neither of the above -> config-server / copied creds (app-team follow-up)
+cmd_classify(){
+  local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
+  [ -s "$apps" ]  || die "no $apps; run resolve first"
+  [ -s "$conns" ] || die "no $conns; run census first"
+  command -v jq >/dev/null || die "jq required"
+
+  # redis_ip -> redis_dep (from census)
+  declare -A DEP_BY_IP
+  local e rd rip rport pip pport
+  while IFS=$'\t' read -r e rd rip rport pip pport; do
+    [ "$e" = env ] && continue; [ -z "$rip" ] && continue
+    DEP_BY_IP["$rip"]="$rd"
+  done < "$conns"
+
+  local out="$OUT/06_classified.tsv"
+  printf 'env\tapp_name\tspace\torg\tmethod\tredis_service_name\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
+  declare -A SVCNAME
+  local cip guid pg ag name sp org dep si svcname method envj bcount
+  while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
+    [ "$e" = env ] && continue; [ -z "$e" ] && continue
+    dep="${DEP_BY_IP[$rip]:-?}"
+    si="${dep: -36}"                                   # last 36 chars = CF service-instance GUID
+
+    # redis service name (cache)
+    if [ -n "${SVCNAME[$si]:-}" ]; then svcname="${SVCNAME[$si]}"
+    else
+      svcname=$(timeout 20 cf curl "/v3/service_instances/$si" 2>/dev/null | jq -r '.name // "?"' 2>/dev/null)
+      [ -z "$svcname" ] && svcname="?"; SVCNAME[$si]="$svcname"
+    fi
+
+    if [ "$ag" = "?" ] || [ -z "$ag" ]; then
+      method="unknown"
+    else
+      # 1) binding to THIS instance?
+      bcount=$(timeout 20 cf curl "/v3/service_credential_bindings?app_guids=$ag&service_instance_guids=$si&per_page=1" 2>/dev/null | jq -r '.pagination.total_results // 0' 2>/dev/null)
+      if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then
+        method="cf-bind"
+      else
+        # 2) redis IP or a REDIS host/url env var present?
+        envj=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
+        if printf '%s' "$envj" | jq -e --arg ip "$rip" '.var // {} | to_entries[]
+             | select((.value|tostring|contains($ip))
+                      or (.key|test("REDIS.*(HOST|URL|URI|ADDR)";"i")))' >/dev/null 2>&1; then
+          method="static-env"
+        else
+          method="unknown"
+        fi
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$svcname" "$dep" "$ag" "$rip" >> "$out"
+  done < "$apps"
+
+  echo "classify: results in $out"
+  column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
+}
+
+# report: final CSV (.txt). Dedups to one row per (app, redis). Adds EXTERNAL consumers
+# (census peers whose IP is not any diego cell) as method=external.
+cmd_report(){
+  local cls="$OUT/06_classified.tsv" conns="$OUT/02_conns.tsv" cm="$OUT/03_cellmap.tsv"
+  [ -s "$cls" ] || die "no $cls; run classify first"
+  local out="$OUT/redis_consumers.txt"
+  echo "app_name,space,org,method,redis_service_name,redis_deployment" > "$out"
+
+  # resolved rows, deduped by (app_guid,redis_deployment)
+  awk -F'\t' 'NR>1 && $8!="" {
+      key=$8 SUBSEP $7; if (seen[key]++) next;
+      print $2","$3","$4","$5","$6","$7 }' "$cls" >> "$out"
+
+  # external consumers: census peer IPs not present as a cell in the cellmap
+  if [ -s "$conns" ] && [ -s "$cm" ]; then
+    local cellips; cellips=$(awk -F'\t' 'NR>1{print $2}' "$cm" | sort -u)
+    awk -F'\t' -v cells="$cellips" '
+      BEGIN{ n=split(cells,a,"\n"); for(i=1;i<=n;i++) C[a[i]]=1 }
+      NR>1 && $5!="" && !($5 in C) {
+        key=$5 SUBSEP $2; if (seen[key]++) next;
+        print "EXTERNAL(" $5 "),,,external,," $2 }' "$conns" >> "$out"
+  fi
+
+  echo "report: final CSV in $out"
+  echo; cat "$out"
+}
 
 # _worker-census: RUNS ON the redis VM as root. Read-only. Emits #RCD#-tagged TSV:
 #   #RCD# <redis_ip> <redis_port> <peer_ip> <peer_port>
