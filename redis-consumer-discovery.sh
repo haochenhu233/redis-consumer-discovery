@@ -167,7 +167,9 @@ cmd_sweep(){
     cslug=$(cell_slug_for_ip "$cip")
     [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; continue; }
     g_cf scp "$SELF" "$cslug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "sweep: scp to $cslug failed"; continue; }
-    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $redis_ips" 2>/dev/null)
+    local dbg=""; [ -n "${RCD_DEBUG:-}" ] && dbg="DEBUG"
+    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" 2>/dev/null)
+    [ -n "${RCD_DEBUG:-}" ] && printf '%s\n' "$raw" | grep -oE '#DBG#.*'
     n=0
     while IFS=$'\t' read -r ccip guid rip; do
       [ -z "$ccip" ] && continue
@@ -204,19 +206,29 @@ _worker_census(){
 # instance_guid = CF_INSTANCE_GUID from a process in that netns (NOGUID if scrubbed;
 # container_ip is the backup join key).
 _worker_sweep(){
+  local dbg=""; [ "${1:-}" = DEBUG ] && { dbg=1; shift; }
   local redis_ips="$*"
   declare -A seen
-  local nsfile pid ino hits guid q qino qpid
+  local nsfile pid ino est nl guid q qino qpid rip cip line total=0
   for nsfile in /proc/[0-9]*/ns/net; do
     pid=${nsfile#/proc/}; pid=${pid%/ns/net}
     ino=$(readlink "$nsfile" 2>/dev/null) || continue
     [ -n "${seen[$ino]:-}" ] && continue
     seen[$ino]=$pid
-    hits=$(nsenter -t "$pid" -n ss -Htn state established 2>/dev/null | awk -v ips="$redis_ips" '
-      BEGIN{ n=split(ips,a," "); for(i=1;i<=n;i++) R[a[i]]=1 }
-      NF>=2 { loc=$(NF-1); peer=$NF; pi=index(peer,":"); pip=substr(peer,1,pi-1);
-              if (pip in R) { li=index(loc,":"); print substr(loc,1,li-1) "\t" pip } }' | sort -u)
-    [ -z "$hits" ] && continue
+    total=$((total+1))
+    est=$(nsenter -t "$pid" -n ss -Htn state established 2>/dev/null)
+    nl=$(printf '%s\n' "$est" | grep -c . )
+    # lines mentioning any redis IP (substring match; robust to v4-mapped-v6 format)
+    local hitlines=""
+    for rip in $redis_ips; do
+      [ -z "$rip" ] && continue
+      line=$(printf '%s\n' "$est" | grep -F "$rip")
+      [ -n "$line" ] && hitlines="$hitlines$line"$'\n'
+    done
+    local hc; hc=$(printf '%s' "$hitlines" | grep -c . )
+    [ -n "$dbg" ] && printf '#DBG#\tns=%s\tpid=%s\test=%s\tredis_hits=%s\n' "$ino" "$pid" "$nl" "$hc"
+    [ "$hc" -eq 0 ] && continue
+    # this netns talks to redis -> capture the app's instance guid
     guid=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | sed -n 's/^CF_INSTANCE_GUID=//p' | head -1)
     if [ -z "$guid" ]; then
       for q in /proc/[0-9]*/ns/net; do
@@ -227,10 +239,20 @@ _worker_sweep(){
         [ -n "$guid" ] && break
       done
     fi
-    printf '%s\n' "$hits" | while IFS=$'\t' read -r cip rip; do
-      printf '#RCD#\t%s\t%s\t%s\n' "$cip" "${guid:-NOGUID}" "$rip"
-    done
+    # emit one row per (container_ip, redis_ip); container_ip = the IP on the line that isn't redis
+    printf '%s\n' "$hitlines" | grep -c . >/dev/null
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      for rip in $redis_ips; do
+        [ -z "$rip" ] && continue
+        printf '%s\n' "$line" | grep -qF "$rip" || continue
+        cip=$(printf '%s\n' "$line" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | grep -vFx "$rip" | head -1)
+        [ -n "$dbg" ] && printf '#DBG#\tMATCH ns=%s cip=%s rip=%s :: %s\n' "$ino" "${cip:-?}" "$rip" "$line"
+        [ -n "$cip" ] && printf '#RCD#\t%s\t%s\t%s\n' "$cip" "${guid:-NOGUID}" "$rip"
+      done
+    done <<< "$hitlines" | sort -u
   done
+  [ -n "$dbg" ] && printf '#DBG#\tnetns_total=%s\n' "$total"
 }
 
 # ------------------------------------------------------------------ dispatch --
