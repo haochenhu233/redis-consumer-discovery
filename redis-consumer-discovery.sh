@@ -264,7 +264,7 @@ case "$SUB" in
   resolve)         cmd_resolve ;;
   classify)        cmd_classify ;;
   report)          cmd_report ;;
-  _worker-census)  _worker_census ;;
-  _worker-sweep)   _worker_sweep ;;
+  _worker-census)  _worker_census "$@" ;;
+  _worker-sweep)   _worker_sweep "$@" ;;
   *) echo "ERROR: unknown subcommand '$SUB'"; exit 1 ;;
 esac
