@@ -139,17 +139,20 @@ cmd_inventory(){ die "inventory: implemented in a later step"; }
 #   --redis <dep> runs the whole pipeline for a single deployment (testing)
 cmd_run(){
   echo "== redis->valkey consumer discovery :: full run =="
+  # Redis only by default -- valkey is the migration TARGET, not a consumer source, so it's
+  # noise at discovery time. Set RCD_INCLUDE_VALKEY=1 to also sweep valkey (e.g. post-migration).
+  local pat='redis'; [ -n "${RCD_INCLUDE_VALKEY:-}" ] && pat='redis|valkey'
   local deps
   if [ -n "$REDIS_DEP" ]; then
     deps="$REDIS_DEP"
   else
     deps=$(g_dir deployments 2>/dev/null \
       | grep -oE '[a-z][a-z0-9_-]*-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-      | grep -iE 'redis|valkey' | sort -u)
+      | grep -iE "$pat" | sort -u)
   fi
-  [ -z "$deps" ] && die "no redis/valkey deployments found (via genesis @$ENV b deployments)"
+  [ -z "$deps" ] && die "no redis deployments found (via genesis @$ENV b deployments)"
   local total; total=$(printf '%s\n' "$deps" | grep -c .)
-  echo "discovered $total redis/valkey deployment(s)"
+  echo "discovered $total redis deployment(s)${RCD_INCLUDE_VALKEY:+ (incl. valkey)}"
 
   [ -z "${RCD_RESUME:-}" ] && rm -f "$OUT/02_conns.tsv" "$OUT/03_cellmap.tsv"
 
