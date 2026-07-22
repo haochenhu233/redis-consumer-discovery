@@ -1,94 +1,101 @@
 #!/usr/bin/env bash
-# Push the fixture consumers that exercise every classification method, then print
-# what the discovery tool SHOULD report for each. Run from this fixtures/ dir, logged
-# into cf and targeted at the test org/space.
+# Push fixture consumers across ONE OR MORE redis instances to exercise every method
+# AND prove the tool iterates all redis deployments + attributes each app to the RIGHT redis.
 #
-#   ./setup.sh <redis-service-instance-name>
+#   ./setup.sh <redis-svc-1> [redis-svc-2 ...]
 #
-# Reads the redis creds via a service key, then pushes 4 CF apps (each keeping a live
-# TCP connection to redis) wired 4 different ways + prints an external-consumer command.
+# redis #1  -> all 4 method variants: cf-bind, static-ref(env), static-ref(command), unknown(hidden)
+# redis #2+ -> cf-bind + static-ref(env)   (proves multi-redis detection & correct attribution)
+# Each app keeps a live TCP connection (idle apps are invisible to the census).
+# Each app stages in its own dir so redis.conf (hidden variant) can't leak into others.
 set -euo pipefail
+[ $# -ge 1 ] || { echo "usage: ./setup.sh <redis-svc-1> [redis-svc-2 ...]"; exit 1; }
+command -v jq >/dev/null || { echo "jq required on the bastion for setup"; exit 1; }
 
-REDIS_SVC="${1:?usage: ./setup.sh <redis-service-instance-name>}"
-APP_BIND="rcd-fix-bind"      # -> cf-bind
-APP_ENV="rcd-fix-env"        # -> static-ref (env var)
-APP_CMD="rcd-fix-cmd"        # -> static-ref (start command)
-APP_HID="rcd-fix-hidden"     # -> unknown    (baked-in config file)
+STAGE=./stage; rm -rf "$STAGE"; mkdir -p "$STAGE"
+: > expected.csv; echo "app,expected_method,expected_redis_service" >> expected.csv
+FIRST_HOST=""; FIRST_PORT=""
 
-echo "== reading redis creds from a service key on $REDIS_SVC =="
-cf create-service-key "$REDIS_SVC" rcd-fix-key >/dev/null 2>&1 || true
-KEY_JSON=$(cf service-key "$REDIS_SVC" rcd-fix-key | sed -n '/{/,$p')
-RHOST=$(printf '%s' "$KEY_JSON" | jq -r '.. | .host? // .hostname? // empty' | head -1)
-RPORT=$(printf '%s' "$KEY_JSON" | jq -r '.. | .port? // empty' | head -1); RPORT="${RPORT:-6379}"
-RPASS=$(printf '%s' "$KEY_JSON" | jq -r '.. | .password? // empty' | head -1)
-echo "redis: $RHOST:$RPORT (password ${RPASS:+set})"
+creds_of(){  # $1=svc -> RHOST RPORT RPASS
+  cf create-service-key "$1" rcd-fix-key >/dev/null 2>&1 || true
+  local j; j=$(cf service-key "$1" rcd-fix-key | sed -n '/{/,$p')
+  RHOST=$(printf '%s' "$j" | jq -r '.. | .host? // .hostname? // empty' | head -1)
+  RPORT=$(printf '%s' "$j" | jq -r '.. | .port? // empty' | head -1); RPORT="${RPORT:-6379}"
+  RPASS=$(printf '%s' "$j" | jq -r '.. | .password? // empty' | head -1)
+}
 
-common="buildpacks: [binary_buildpack]
+push_variant(){  # $1=app $2=mode(bind|env|cmd|hidden) $3=svc
+  local app="$1" mode="$2" svc="$3" d="$STAGE/$1"
+  mkdir -p "$d"; cp run.sh "$d/"
+  local common="  buildpacks: [binary_buildpack]
   health-check-type: process
   memory: 64M
   instances: 1"
-
-# 1) cf-bind: standard binding, app reads VCAP_SERVICES
-cat > manifest-bind.yml <<YAML
+  case "$mode" in
+    bind) cat > "$d/manifest.yml" <<YAML
 applications:
-- name: $APP_BIND
+- name: $app
   command: bash run.sh
-  $common
-  services: [$REDIS_SVC]
+$common
+  services: [$svc]
 YAML
-
-# 2) static-ref (env): no binding, redis in env vars
-cat > manifest-env.yml <<YAML
+      ;;
+    env) cat > "$d/manifest.yml" <<YAML
 applications:
-- name: $APP_ENV
+- name: $app
   command: bash run.sh
-  $common
+$common
   env:
     REDIS_HOST: "$RHOST"
     REDIS_PORT: "$RPORT"
     REDIS_PASSWORD: "$RPASS"
 YAML
-
-# 3) static-ref (command): no binding, no env: block; redis on the start command
-cat > manifest-cmd.yml <<YAML
+      ;;
+    cmd) cat > "$d/manifest.yml" <<YAML
 applications:
-- name: $APP_CMD
+- name: $app
   command: env REDIS_HOST=$RHOST REDIS_PORT=$RPORT REDIS_PASSWORD=$RPASS bash run.sh
-  $common
+$common
 YAML
-
-# 4) unknown: no binding, no env, no command ref; creds in a baked-in config file
-cat > redis.conf <<CONF
-REDIS_HOST=$RHOST
-REDIS_PORT=$RPORT
-REDIS_PASSWORD=$RPASS
-CONF
-cat > manifest-hidden.yml <<YAML
+      ;;
+    hidden) printf 'REDIS_HOST=%s\nREDIS_PORT=%s\nREDIS_PASSWORD=%s\n' "$RHOST" "$RPORT" "$RPASS" > "$d/redis.conf"
+      cat > "$d/manifest.yml" <<YAML
 applications:
-- name: $APP_HID
+- name: $app
   command: bash run.sh
-  $common
+$common
 YAML
+      ;;
+  esac
+  ( cd "$d" && cf push -f manifest.yml )
+}
 
-echo "== pushing fixtures =="
-cf push -f manifest-bind.yml
-cf push -f manifest-env.yml
-cf push -f manifest-cmd.yml
-cf push -f manifest-hidden.yml     # redis.conf is uploaded with the app bits
-rm -f redis.conf                    # keep the baked-in file out of the other apps' next push
+i=0
+for svc in "$@"; do
+  i=$((i+1)); creds_of "$svc"
+  [ -z "$FIRST_HOST" ] && { FIRST_HOST="$RHOST"; FIRST_PORT="$RPORT"; }
+  echo "== redis #$i: $svc -> $RHOST:$RPORT =="
+  push_variant "rcd-fix-bind-$i" bind "$svc"; echo "rcd-fix-bind-$i,cf-bind,$svc" >> expected.csv
+  push_variant "rcd-fix-env-$i"  env  "$svc"; echo "rcd-fix-env-$i,static-ref,$svc" >> expected.csv
+  if [ "$i" -eq 1 ]; then
+    push_variant "rcd-fix-cmd-$i"    cmd    "$svc"; echo "rcd-fix-cmd-$i,static-ref,$svc" >> expected.csv
+    push_variant "rcd-fix-hidden-$i" hidden "$svc"; echo "rcd-fix-hidden-$i,unknown,$svc" >> expected.csv
+  fi
+done
 
+echo
+echo "== expected classification (also in expected.csv) =="
+column -t -s, expected.csv
 cat <<EOF
 
-== expected discovery classification ==
-  $APP_BIND    -> cf-bind
-  $APP_ENV     -> static-ref   (redis in env)
-  $APP_CMD     -> static-ref   (redis on start command; NOT in env: -- exercises the manifest path)
-  $APP_HID     -> unknown      (redis only in a baked-in config file, invisible to CF)
+== external (non-CF) consumer: run on the BASTION for an 'external' row (uses redis #1) ==
+  while true; do exec 3<>/dev/tcp/$FIRST_HOST/$FIRST_PORT && sleep 30; done
 
-== external (non-CF) consumer: run this from the BASTION to get an 'external' row ==
-  while true; do exec 3<>/dev/tcp/$RHOST/$RPORT && sleep 30; done
-  (source IP is the bastion, not a diego cell -> classified 'external')
+Keep apps running, then:   redis-consumer-discovery.sh run <env>
+Compare redis_consumers.txt against expected.csv (method AND redis_service).
 
-Keep these running, then:  redis-consumer-discovery.sh run <env>
-Teardown:  cf delete $APP_BIND -f; cf delete $APP_ENV -f; cf delete $APP_CMD -f; cf delete $APP_HID -f; cf delete-service-key $REDIS_SVC rcd-fix-key -f
+Teardown:
+  for a in \$(cut -d, -f1 expected.csv | tail -n +2); do cf delete \$a -f; done
+  for s in $*; do cf delete-service-key \$s rcd-fix-key -f; done
+  rm -rf stage expected.csv
 EOF

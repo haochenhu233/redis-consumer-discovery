@@ -10,11 +10,11 @@ set -u
 # variant 3/4: source a baked-in config file if present (no env, no binding)
 [ -f ./redis.conf ] && . ./redis.conf 2>/dev/null
 
-# variant 1: parse VCAP_SERVICES if bound (first redis-ish service)
-if [ -z "${REDIS_HOST:-}" ] && [ -n "${VCAP_SERVICES:-}" ] && command -v jq >/dev/null 2>&1; then
-  REDIS_HOST=$(printf '%s' "$VCAP_SERVICES" | jq -r '[.[][]?.credentials|select(.)|(.host//.hostname)]|map(select(.))[0]//empty')
-  REDIS_PORT=$(printf '%s' "$VCAP_SERVICES" | jq -r '[.[][]?.credentials|select(.)|.port]|map(select(.))[0]//empty')
-  REDIS_PASSWORD=$(printf '%s' "$VCAP_SERVICES" | jq -r '[.[][]?.credentials|select(.)|.password]|map(select(.))[0]//empty')
+# variant 1: parse VCAP_SERVICES if bound -- jq-free (jq is not in the binary buildpack)
+if [ -z "${REDIS_HOST:-}" ] && [ -n "${VCAP_SERVICES:-}" ]; then
+  REDIS_HOST=$(printf '%s' "$VCAP_SERVICES" | grep -oE '"(host|hostname)":"[^"]*"' | head -1 | sed -E 's/.*":"//; s/"$//')
+  REDIS_PORT=$(printf '%s' "$VCAP_SERVICES" | grep -oE '"port":[0-9]+' | head -1 | grep -oE '[0-9]+')
+  REDIS_PASSWORD=$(printf '%s' "$VCAP_SERVICES" | grep -oE '"password":"[^"]*"' | head -1 | sed -E 's/.*":"//; s/"$//')
 fi
 
 : "${REDIS_HOST:?REDIS_HOST not set (env, redis.conf, or VCAP_SERVICES)}"
