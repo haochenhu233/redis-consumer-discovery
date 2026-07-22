@@ -50,9 +50,17 @@ case "$SUB" in
 esac
 
 # ---- genesis helpers ----
-# wrap genesis in `timeout` so one unreachable/hung VM can't stall a whole-estate run.
-RCD_TIMEOUT="${RCD_SSH_TIMEOUT:-120}"
-_gt(){ if command -v timeout >/dev/null 2>&1; then timeout "$RCD_TIMEOUT" "$@"; else "$@"; fi; }
+# Optional hang-protection: only wrap genesis in `timeout` when RCD_SSH_TIMEOUT is explicitly
+# set AND a GNU-style timeout exists. Default = direct call (some bastions have BusyBox timeout
+# that needs `-t`, or genesis misbehaves off a TTY -- either breaks discovery). Opt in with e.g.
+# RCD_SSH_TIMEOUT=120 once you've confirmed `timeout 1 true` works on your bastion.
+_gt(){
+  if [ -n "${RCD_SSH_TIMEOUT:-}" ] && command -v timeout >/dev/null 2>&1 && timeout 1 true 2>/dev/null; then
+    timeout "$RCD_SSH_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
 g_dir(){ _gt genesis "@$ENV"    b "$@"; }           # genesis @<env> b ...     (director; add -d for redis)
 g_cf(){  _gt genesis "@$ENV:cf" b "$@"; }           # genesis @<env>:cf b ...  (CF / diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
