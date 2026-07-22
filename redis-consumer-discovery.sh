@@ -50,8 +50,11 @@ case "$SUB" in
 esac
 
 # ---- genesis helpers ----
-g_dir(){ genesis "@$ENV"    b "$@"; }               # genesis @<env> b ...     (director; add -d for redis)
-g_cf(){  genesis "@$ENV:cf" b "$@"; }               # genesis @<env>:cf b ...  (CF / diego cells)
+# wrap genesis in `timeout` so one unreachable/hung VM can't stall a whole-estate run.
+RCD_TIMEOUT="${RCD_SSH_TIMEOUT:-120}"
+_gt(){ if command -v timeout >/dev/null 2>&1; then timeout "$RCD_TIMEOUT" "$@"; else "$@"; fi; }
+g_dir(){ _gt genesis "@$ENV"    b "$@"; }           # genesis @<env> b ...     (director; add -d for redis)
+g_cf(){  _gt genesis "@$ENV:cf" b "$@"; }           # genesis @<env>:cf b ...  (CF / diego cells)
 line(){ printf '\n=== %s ===\n' "$1"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 # cfdot is provisioned via the diego LOGIN profile (adds it to PATH + exports BBS certs/env).
@@ -156,8 +159,8 @@ cmd_run(){
 
   [ -z "${RCD_RESUME:-}" ] && rm -f "$OUT/02_conns.tsv" "$OUT/03_cellmap.tsv"
 
-  echo "== phase 1/2: census ALL $total redis (skips orphaned/idle) =="
-  local i=0 d
+  echo "== phase 1/2: census ALL $total redis (each isolated; failures skip, never abort) =="
+  local i=0 d ok=0 fail=0
   while IFS= read -r d; do
     [ -z "$d" ] && continue
     i=$((i+1))
@@ -165,8 +168,9 @@ cmd_run(){
       echo "[$i/$total] census $d :: SKIP (already censused)"; continue
     fi
     echo "[$i/$total] census $d"
-    ( REDIS_DEP="$d"; cmd_census ) || echo "  !! census error for $d (continuing)"
+    if ( REDIS_DEP="$d"; cmd_census ); then ok=$((ok+1)); else fail=$((fail+1)); echo "  !! census error for $d (continuing)"; fi
   done < <(printf '%s\n' "$deps")
+  echo "== census pass: $ok ran, $fail hard-errored (skipped) of $total =="
 
   local nconn=0; [ -s "$OUT/02_conns.tsv" ] && nconn=$(($(wc -l < "$OUT/02_conns.tsv") - 1))
   echo "== census complete: $nconn live connection(s) across $total redis =="
@@ -194,6 +198,13 @@ cmd_census(){
   g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "census: scp to $slug failed (VM down?) - skipping"; return 0; }
   # tr -d '\r': bosh ssh returns CRLF; strip it so it never enters the data (else IP keys carry \r)
   local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' 2>/dev/null | tr -d '\r')
+
+  # distinguish worker-ran-but-empty from ssh/worker failure via the sentinel
+  if ! printf '%s' "$raw" | grep -q '#RCD-DONE#'; then
+    local hint; hint=$(printf '%s' "$raw" | grep -vE '^\s*$' | head -1)
+    echo "census: $REDIS_DEP -> worker did not complete (ssh/timeout/perm) - skipping${hint:+  [$hint]}"
+    return 0
+  fi
 
   local f="$OUT/02_conns.tsv"
   [ -s "$f" ] || printf 'env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port\n' > "$f"
@@ -428,6 +439,7 @@ _worker_census(){
               if (li>0 && pi>0)
                 printf "#RCD#\t%s\t%s\t%s\t%s\n", substr(loc,1,li-1), p, substr(peer,1,pi-1), substr(peer,pi+1) }'
   done
+  echo "#RCD-DONE#"                                   # sentinel: proves the worker actually ran
 }
 # _worker-sweep <redis_ip...>: RUNS ON a diego cell as root. Read-only.
 # For each network namespace with an established connection to a redis IP, emits:
