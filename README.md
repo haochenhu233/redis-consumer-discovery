@@ -1,7 +1,7 @@
 # redis-consumer-discovery
 
 Single-file tool to discover which Cloud Foundry apps consume each Blacksmith-managed
-Redis instance, and **how** they reach it (standard binding / static env / unknown /
+Redis instance, and **how** they reach it (standard binding / static ref / unknown /
 external), ahead of a Redis→Valkey migration.
 
 It traces **from the Redis side → Diego cell → app**, so it also catches consumers that

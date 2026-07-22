@@ -2,7 +2,7 @@
 # redis-consumer-discovery.sh  (single-file tool)
 #
 # Discover which CF apps consume each Blacksmith-managed redis, and HOW
-# (cf-bind / static-env / unknown / external), for the redis->valkey migration.
+# (cf-bind / static-ref / unknown / external), for the redis->valkey migration.
 # Traces from the redis side -> diego cell -> app, so it also finds consumers
 # that have NO cf binding / env / manifest (invisible to config scans).
 #
@@ -261,9 +261,11 @@ cmd_resolve(){
 }
 # classify: assign a migration method per resolved app+redis -> $OUT/06_classified.tsv
 #   cf-bind    : app has a binding to THIS redis service instance (auto-migrates)
-#   static-env : redis IP / a REDIS host|url env var present in the app's CF env
-#                (env-var and push-manifest 'env:' are indistinguishable platform-side)
-#   unknown    : connects, but neither of the above -> config-server / copied creds (app-team follow-up)
+#   static-ref : redis IP / .bosh host / port / service-name appears in the app's reconstructed
+#                CF manifest (covers env:, command:, sidecars:) -- env-var vs manifest can't be
+#                separated platform-side; both are one static reference.
+#   unknown    : connects, but redis appears nowhere in the manifest -> droplet config file /
+#                config-server / copied creds (app-team follow-up)
 cmd_classify(){
   local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
   [ -s "$apps" ]  || die "no $apps; run resolve first"
@@ -281,7 +283,7 @@ cmd_classify(){
   local out="$OUT/06_classified.tsv"
   printf 'env\tapp_name\tspace\torg\tmethod\tredis_service_name\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
   declare -A SVCNAME
-  local cip guid pg ag name sp org dep si svcname method envj bcount
+  local cip guid pg ag name sp org dep si svcname method man bcount
   while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
     dep="${DEP_BY_IP[$rip]:-?}"
@@ -302,12 +304,13 @@ cmd_classify(){
       if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then
         method="cf-bind"
       else
-        # 2) redis IP or a REDIS host/url env var present?
-        envj=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
-        if printf '%s' "$envj" | jq -e --arg ip "$rip" '.var // {} | to_entries[]
-             | select((.value|tostring|contains($ip))
-                      or (.key|test("REDIS.*(HOST|URL|URI|ADDR)";"i")))' >/dev/null 2>&1; then
-          method="static-env"
+        # 2) redis IP / .bosh host / port / service-name anywhere in the reconstructed manifest
+        #    (YAML superset: env:, command:, sidecars:, services:). Grep is enough - it's flat text.
+        man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
+        # precise signals: redis IP, the deployment name (appears in .bosh DNS refs; specific),
+        # a redis:// URL, or a REDIS host/url key. Bare port omitted (too false-positive-prone).
+        if printf '%s' "$man" | grep -qiE "${rip//./\\.}|${dep}|redis://|REDIS[_A-Z0-9]*(HOST|URL|URI|ADDR)" 2>/dev/null; then
+          method="static-ref"
         else
           method="unknown"
         fi
