@@ -140,7 +140,8 @@ cmd_census(){
   local slug; slug=$(dep_slug "$REDIS_DEP")
   [ -z "$slug" ] && die "could not parse instance slug for '$REDIS_DEP' (run: genesis @$ENV b -d $REDIS_DEP instances)"
   g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || die "scp worker to $slug failed"
-  local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' 2>/dev/null)
+  # tr -d '\r': bosh ssh returns CRLF; strip it so it never enters the data (else IP keys carry \r)
+  local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' 2>/dev/null | tr -d '\r')
 
   local f="$OUT/02_conns.tsv"
   [ -s "$f" ] || printf 'env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port\n' > "$f"
@@ -174,7 +175,7 @@ cmd_sweep(){
     [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; continue; }
     g_cf scp "$SELF" "$cslug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "sweep: scp to $cslug failed"; continue; }
     local dbg=""; [ -n "${RCD_DEBUG:-}" ] && dbg="DEBUG"
-    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" 2>/dev/null)
+    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" 2>/dev/null | tr -d '\r')
     [ -n "${RCD_DEBUG:-}" ] && printf '%s\n' "$raw" | grep -oE '#DBG#.*'
     n=0
     while IFS=$'\t' read -r ccip guid rip; do
@@ -276,7 +277,9 @@ cmd_classify(){
   declare -A DEP_BY_IP
   local e rd rip rport pip pport
   while IFS=$'\t' read -r e rd rip rport pip pport; do
-    [ "$e" = env ] && continue; [ -z "$rip" ] && continue
+    [ "$e" = env ] && continue
+    rip=${rip//$'\r'/}; rd=${rd//$'\r'/}               # defensive: strip stray CR from older files
+    [ -z "$rip" ] && continue
     DEP_BY_IP["$rip"]="$rd"
   done < "$conns"
 
@@ -286,6 +289,7 @@ cmd_classify(){
   local cip guid pg ag name sp org dep si svcname method man bcount
   while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
+    rip=${rip//$'\r'/}; ag=${ag//$'\r'/}; org=${org//$'\r'/}   # defensive: strip stray CR
     [ -z "$rip" ] && continue
     dep="${DEP_BY_IP[$rip]:-?}"
     si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"    # last 36 chars = CF service-instance GUID (empty if dep unresolved)
