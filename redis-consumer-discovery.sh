@@ -156,6 +156,7 @@ cmd_run(){
 
   [ -z "${RCD_RESUME:-}" ] && rm -f "$OUT/02_conns.tsv" "$OUT/03_cellmap.tsv"
 
+  echo "== phase 1/2: census ALL $total redis (skips orphaned/idle) =="
   local i=0 d
   while IFS= read -r d; do
     [ -z "$d" ] && continue
@@ -164,14 +165,22 @@ cmd_run(){
       echo "[$i/$total] census $d :: SKIP (already censused)"; continue
     fi
     echo "[$i/$total] census $d"
-    ( REDIS_DEP="$d"; cmd_census ) || echo "  !! census failed for $d (continuing)"
+    ( REDIS_DEP="$d"; cmd_census ) || echo "  !! census error for $d (continuing)"
   done < <(printf '%s\n' "$deps")
 
-  echo "== sweep cells =="
+  local nconn=0; [ -s "$OUT/02_conns.tsv" ] && nconn=$(($(wc -l < "$OUT/02_conns.tsv") - 1))
+  echo "== census complete: $nconn live connection(s) across $total redis =="
+  if [ "$nconn" -le 0 ]; then
+    echo "no live client connections found -> nothing to sweep."
+    echo "  (all redis idle/orphaned, or consumer apps aren't holding connections - see cf apps/logs & ASGs)"
+    return 0
+  fi
+
+  echo "== phase 2/2: sweep all diego-cells that appeared, then resolve/classify =="
   cmd_sweep || echo "  !! sweep had errors (continuing)"
-  echo "== resolve =="; cmd_resolve || die "resolve failed"
-  echo "== classify =="; cmd_classify || die "classify failed"
-  echo "== report =="; cmd_report
+  cmd_resolve  || die "resolve failed"
+  cmd_classify || die "classify failed"
+  cmd_report
   echo; echo "== done :: $OUT/redis_consumers.txt =="
 }
 
@@ -180,8 +189,9 @@ cmd_run(){
 cmd_census(){
   [ -z "$REDIS_DEP" ] && die "census requires --redis <dep>"
   local slug; slug=$(dep_slug "$REDIS_DEP")
-  [ -z "$slug" ] && die "could not parse instance slug for '$REDIS_DEP' (run: genesis @$ENV b -d $REDIS_DEP instances)"
-  g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || die "scp worker to $slug failed"
+  # orphaned redis (index entry but no BOSH deployment/VM) -> skip gracefully, don't abort a run
+  [ -z "$slug" ] && { echo "census: $REDIS_DEP has no instances (orphaned / no deployment) - skipping"; return 0; }
+  g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "census: scp to $slug failed (VM down?) - skipping"; return 0; }
   # tr -d '\r': bosh ssh returns CRLF; strip it so it never enters the data (else IP keys carry \r)
   local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' 2>/dev/null | tr -d '\r')
 
@@ -206,7 +216,10 @@ cmd_sweep(){
   local redis_ips cell_ips
   redis_ips=$(awk -F'\t' 'NR>1{print $3}' "$conns" | sort -u | tr '\n' ' ')
   cell_ips=$(awk -F'\t' 'NR>1{print $5}' "$conns" | sort -u)
-  [ -z "${redis_ips// /}" ] && die "no redis IPs in $conns"
+  if [ -z "${redis_ips// /}" ]; then
+    echo "sweep: no live client connections recorded (all redis idle/orphaned, or apps not connected) - nothing to sweep"
+    return 0
+  fi
 
   local f="$OUT/03_cellmap.tsv"
   [ -s "$f" ] || printf 'env\tcell_ip\tcell_instance\tcontainer_ip\tinstance_guid\tredis_ip\n' > "$f"
