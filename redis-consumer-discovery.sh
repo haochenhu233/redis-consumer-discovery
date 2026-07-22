@@ -286,21 +286,26 @@ cmd_classify(){
   local cip guid pg ag name sp org dep si svcname method man bcount
   while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
+    [ -z "$rip" ] && continue
     dep="${DEP_BY_IP[$rip]:-?}"
-    si="${dep: -36}"                                   # last 36 chars = CF service-instance GUID
+    si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"    # last 36 chars = CF service-instance GUID (empty if dep unresolved)
 
-    # redis service name (cache)
-    if [ -n "${SVCNAME[$si]:-}" ]; then svcname="${SVCNAME[$si]}"
-    else
-      svcname=$(timeout 20 cf curl "/v3/service_instances/$si" 2>/dev/null | jq -r '.name // "?"' 2>/dev/null)
-      [ -z "$svcname" ] && svcname="?"; SVCNAME[$si]="$svcname"
+    # redis service name (cache) -- only when we have a service GUID
+    svcname="?"
+    if [ -n "$si" ]; then
+      if [ -n "${SVCNAME[$si]:-}" ]; then svcname="${SVCNAME[$si]}"
+      else
+        svcname=$(timeout 20 cf curl "/v3/service_instances/$si" 2>/dev/null | jq -r '.name // "?"' 2>/dev/null)
+        [ -z "$svcname" ] && svcname="?"; SVCNAME[$si]="$svcname"
+      fi
     fi
 
     if [ "$ag" = "?" ] || [ -z "$ag" ]; then
       method="unknown"
     else
-      # 1) binding to THIS instance?
-      bcount=$(timeout 20 cf curl "/v3/service_credential_bindings?app_guids=$ag&service_instance_guids=$si&per_page=1" 2>/dev/null | jq -r '.pagination.total_results // 0' 2>/dev/null)
+      # 1) binding to THIS instance? (only checkable if we resolved the service GUID)
+      bcount=0
+      [ -n "$si" ] && bcount=$(timeout 20 cf curl "/v3/service_credential_bindings?app_guids=$ag&service_instance_guids=$si&per_page=1" 2>/dev/null | jq -r '.pagination.total_results // 0' 2>/dev/null)
       if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then
         method="cf-bind"
       else
