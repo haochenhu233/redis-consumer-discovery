@@ -168,8 +168,9 @@ cmd_run(){
   [ -z "${RCD_RESUME:-}" ] && rm -f "$OUT/02_conns.tsv" "$OUT/03_cellmap.tsv"
 
   echo "== phase 1/2: census ALL $total redis (each isolated; failures skip, never abort) =="
-  local i=0 d ok=0 fail=0
-  while IFS= read -r d; do
+  local i=0 d ok=0 fail=0 DEPS=()
+  mapfile -t DEPS < <(printf '%s\n' "$deps")           # read into an array first; ssh in the loop
+  for d in "${DEPS[@]}"; do                             # would otherwise consume a piped stream
     [ -z "$d" ] && continue
     i=$((i+1))
     if [ -n "${RCD_RESUME:-}" ] && [ -s "$OUT/02_conns.tsv" ] && grep -qF "$d" "$OUT/02_conns.tsv"; then
@@ -177,7 +178,7 @@ cmd_run(){
     fi
     echo "[$i/$total] census $d"
     if ( REDIS_DEP="$d"; cmd_census ); then ok=$((ok+1)); else fail=$((fail+1)); echo "  !! census error for $d (continuing)"; fi
-  done < <(printf '%s\n' "$deps")
+  done
   echo "== census pass: $ok ran, $fail hard-errored (skipped) of $total =="
 
   local nconn=0; [ -s "$OUT/02_conns.tsv" ] && nconn=$(($(wc -l < "$OUT/02_conns.tsv") - 1))
@@ -205,7 +206,8 @@ cmd_census(){
   [ -z "$slug" ] && { echo "census: $REDIS_DEP has no instances (orphaned / no deployment) - skipping"; return 0; }
   g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "census: scp to $slug failed (VM down?) - skipping"; return 0; }
   # tr -d '\r': bosh ssh returns CRLF; strip it so it never enters the data (else IP keys carry \r)
-  local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' 2>/dev/null | tr -d '\r')
+  # </dev/null: bosh ssh reads stdin; without this it eats the caller's loop input (only 1 of N runs)
+  local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' </dev/null 2>/dev/null | tr -d '\r')
 
   # distinguish worker-ran-but-empty from ssh/worker failure via the sentinel
   if ! printf '%s' "$raw" | grep -q '#RCD-DONE#'; then
@@ -224,7 +226,8 @@ cmd_census(){
   done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
 
   echo "census: $REDIS_DEP -> $n live connection(s)  (appended to $f)"
-  printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2- | sed 's/^/  redis_ip=/;s/\t/ port=/;s/\t/ peer=/;s/\t/:/'
+  printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2- | sed 's/^/  redis_ip=/;s/\t/ port=/;s/\t/ peer=/;s/\t/:/' || true
+  return 0                                            # ran successfully even if 0 connections
 }
 
 # sweep: for each cell in 02_conns.tsv, resolve its containers' connections to redis
@@ -249,7 +252,7 @@ cmd_sweep(){
     [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; continue; }
     g_cf scp "$SELF" "$cslug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "sweep: scp to $cslug failed"; continue; }
     local dbg=""; [ -n "${RCD_DEBUG:-}" ] && dbg="DEBUG"
-    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" 2>/dev/null | tr -d '\r')
+    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" </dev/null 2>/dev/null | tr -d '\r')
     [ -n "${RCD_DEBUG:-}" ] && printf '%s\n' "$raw" | grep -oE '#DBG#.*'
     n=0
     while IFS=$'\t' read -r ccip guid rip; do
