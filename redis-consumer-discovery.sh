@@ -133,6 +133,45 @@ cmd_preflight(){
 # ------------------------------------------------- stages (built stepwise) ---
 cmd_inventory(){ die "inventory: implemented in a later step"; }
 
+# run: full estate sweep -> $OUT/redis_consumers.txt
+#   discover all redis/valkey deployments -> census each -> sweep cells -> resolve -> classify -> report
+#   RCD_RESUME=1  keeps existing 02/03 files and skips deployments already censused
+#   --redis <dep> runs the whole pipeline for a single deployment (testing)
+cmd_run(){
+  echo "== redis->valkey consumer discovery :: full run =="
+  local deps
+  if [ -n "$REDIS_DEP" ]; then
+    deps="$REDIS_DEP"
+  else
+    deps=$(g_dir deployments 2>/dev/null \
+      | grep -oE '[a-z][a-z0-9_-]*-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+      | grep -iE 'redis|valkey' | sort -u)
+  fi
+  [ -z "$deps" ] && die "no redis/valkey deployments found (via genesis @$ENV b deployments)"
+  local total; total=$(printf '%s\n' "$deps" | grep -c .)
+  echo "discovered $total redis/valkey deployment(s)"
+
+  [ -z "${RCD_RESUME:-}" ] && rm -f "$OUT/02_conns.tsv" "$OUT/03_cellmap.tsv"
+
+  local i=0 d
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    i=$((i+1))
+    if [ -n "${RCD_RESUME:-}" ] && [ -s "$OUT/02_conns.tsv" ] && grep -qF "$d" "$OUT/02_conns.tsv"; then
+      echo "[$i/$total] census $d :: SKIP (already censused)"; continue
+    fi
+    echo "[$i/$total] census $d"
+    ( REDIS_DEP="$d"; cmd_census ) || echo "  !! census failed for $d (continuing)"
+  done < <(printf '%s\n' "$deps")
+
+  echo "== sweep cells =="
+  cmd_sweep || echo "  !! sweep had errors (continuing)"
+  echo "== resolve =="; cmd_resolve || die "resolve failed"
+  echo "== classify =="; cmd_classify || die "classify failed"
+  echo "== report =="; cmd_report
+  echo; echo "== done :: $OUT/redis_consumers.txt =="
+}
+
 # census: list live client connections to a redis deployment -> $OUT/02_conns.tsv
 # scp's this script to the redis VM and runs _worker-census there (read-only ss).
 cmd_census(){
@@ -441,6 +480,7 @@ _worker_sweep(){
 # ------------------------------------------------------------------ dispatch --
 case "$SUB" in
   preflight)       cmd_preflight ;;
+  run)             cmd_run ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
   sweep)           cmd_sweep ;;
