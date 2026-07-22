@@ -144,6 +144,22 @@ cmd_preflight(){
 # ------------------------------------------------- stages (built stepwise) ---
 cmd_inventory(){ die "inventory: implemented in a later step"; }
 
+# merge-orphaned: combine all per-scan orphaned snapshots -> $OUT/orphaned_merged.tsv
+# A redis with 0 consumers in EVERY scan (count == total scans) is flagged truly_orphaned=YES.
+cmd_merge_orphaned(){
+  local dir="$OUT/orphaned"
+  local files; files=$(ls "$dir"/orphaned-*.tsv 2>/dev/null || true)
+  [ -z "$files" ] && die "no orphaned scan files in $dir (run some scans first)"
+  local nscans; nscans=$(printf '%s\n' "$files" | grep -c .)
+  local out="$OUT/orphaned_merged.tsv"
+  printf 'redis_deployment\tscans_with_0_consumers\ttotal_scans\ttruly_orphaned\n' > "$out"
+  # shellcheck disable=SC2086
+  grep -hv '^redis_deployment' $files | cut -f1 | sort | uniq -c \
+    | awk -v n="$nscans" '{print $2"\t"$1"\t"n"\t"($1==n?"YES":"no")}' | sort -k4,4r -k2,2rn >> "$out"
+  echo "merged $nscans scan(s) -> $out"
+  column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
+}
+
 # run: full estate sweep -> $OUT/redis_consumers.txt
 #   discover all redis/valkey deployments -> census each -> sweep cells -> resolve -> classify -> report
 #   RCD_RESUME=1  keeps existing 02/03 files and skips deployments already censused
@@ -180,6 +196,20 @@ cmd_run(){
     if ( REDIS_DEP="$d"; cmd_census ); then ok=$((ok+1)); else fail=$((fail+1)); echo "  !! census error for $d (continuing)"; fi
   done
   echo "== census pass: $ok ran, $fail hard-errored (skipped) of $total =="
+
+  # orphaned snapshot: every discovered redis with 0 live connections THIS scan (timestamped).
+  # Merge across days (merge-orphaned) to find redis unused in EVERY scan = truly orphaned.
+  mkdir -p "$OUT/orphaned"
+  local ts; ts=$(date -u +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
+  local ofile="$OUT/orphaned/orphaned-$ts.tsv"
+  printf 'redis_deployment\tlive_connections\tscan_utc\n' > "$ofile"
+  local norph=0 c
+  for d in "${DEPS[@]}"; do
+    [ -z "$d" ] && continue
+    c=$(awk -F'\t' -v dep="$d" 'NR>1 && $2==dep{n++} END{print n+0}' "$OUT/02_conns.tsv" 2>/dev/null)
+    if [ "${c:-0}" -eq 0 ]; then printf '%s\t0\t%s\n' "$d" "$ts" >> "$ofile"; norph=$((norph+1)); fi
+  done
+  echo "== orphaned this scan: $norph redis with 0 consumers -> $ofile =="
 
   local nconn=0; [ -s "$OUT/02_conns.tsv" ] && nconn=$(($(wc -l < "$OUT/02_conns.tsv") - 1))
   echo "== census complete: $nconn live connection(s) across $total redis =="
@@ -339,11 +369,12 @@ cmd_resolve(){
 }
 # classify: assign a migration method per resolved app+redis -> $OUT/06_classified.tsv
 #   cf-bind    : app has a binding to THIS redis service instance (auto-migrates)
-#   static-ref : redis IP / .bosh host / port / service-name appears in the app's reconstructed
-#                CF manifest (covers env:, command:, sidecars:) -- env-var vs manifest can't be
-#                separated platform-side; both are one static reference.
-#   unknown    : connects, but redis appears nowhere in the manifest -> droplet config file /
-#                config-server / copied creds (app-team follow-up)
+#   static-ref: env-var  : redis appears in the app's environment variables (manifest env: block
+#                          or `cf set-env` -- indistinguishable, both land in the CF env store)
+#   static-ref: manifest : redis appears elsewhere in the reconstructed manifest (command:,
+#                          sidecars:) but NOT in env vars
+#   unknown              : connects, but redis appears nowhere CF can see -> droplet config file /
+#                          config-server / copied creds (app-team follow-up)
 cmd_classify(){
   local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
   [ -s "$apps" ]  || die "no $apps; run resolve first"
@@ -390,13 +421,16 @@ cmd_classify(){
       if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then
         method="cf-bind"
       else
-        # 2) redis IP / .bosh host / port / service-name anywhere in the reconstructed manifest
-        #    (YAML superset: env:, command:, sidecars:, services:). Grep is enough - it's flat text.
-        man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
-        # precise signals: redis IP, the deployment name (appears in .bosh DNS refs; specific),
-        # a redis:// URL, or a REDIS host/url key. Bare port omitted (too false-positive-prone).
-        if printf '%s' "$man" | grep -qiE "${rip//./\\.}|${dep}|redis://|REDIS[_A-Z0-9]*(HOST|URL|URI|ADDR)" 2>/dev/null; then
-          method="static-ref"
+        # precise redis signals: redis IP, deployment name (appears in .bosh DNS refs), a
+        # redis:// URL, or a REDIS host/url key. (Bare port omitted -- too false-positive-prone.)
+        local pat="${rip//./\\.}|redis://|REDIS[_A-Z0-9]*(HOST|URL|URI|ADDR)"
+        [ "$dep" != "?" ] && [ -n "$dep" ] && pat="$pat|${dep}"
+        # 2) in the app's ENV VARS? (manifest env: block or `cf set-env`) -> env-var
+        if timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null | grep -qiE "$pat" 2>/dev/null; then
+          method="static-ref: env-var"
+        # 3) elsewhere in the reconstructed manifest (command:, sidecars:), not in env -> manifest
+        elif timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null | grep -qiE "$pat" 2>/dev/null; then
+          method="static-ref: manifest"
         else
           method="unknown"
         fi
@@ -520,6 +554,7 @@ _worker_sweep(){
 case "$SUB" in
   preflight)       cmd_preflight ;;
   run)             cmd_run ;;
+  merge-orphaned)  cmd_merge_orphaned ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
   sweep)           cmd_sweep ;;
