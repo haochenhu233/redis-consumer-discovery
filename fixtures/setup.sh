@@ -9,6 +9,7 @@
 # Each app keeps a live TCP connection (idle apps are invisible to the census).
 # Each app stages in its own dir so redis.conf (hidden variant) can't leak into others.
 set -euo pipefail
+cd "$(dirname "$0")"                      # run from the fixtures dir so run.sh is found from anywhere
 [ $# -ge 1 ] || { echo "usage: ./setup.sh <redis-svc-1> [redis-svc-2 ...]"; exit 1; }
 command -v jq >/dev/null || { echo "jq required on the bastion for setup"; exit 1; }
 
