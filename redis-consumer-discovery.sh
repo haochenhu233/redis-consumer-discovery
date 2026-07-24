@@ -417,8 +417,11 @@ cmd_resolve(){
 #                          or `cf set-env` -- indistinguishable, both land in the CF env store)
 #   static-ref: manifest : redis appears elsewhere in the reconstructed manifest (command:,
 #                          sidecars:) but NOT in env vars
-#   unknown              : connects, but redis appears nowhere CF can see -> droplet config file /
-#                          config-server / copied creds (app-team follow-up)
+#   unknown              : app IDENTIFIED, connects, but redis appears nowhere CF can see ->
+#                          droplet config file / config-server / copied creds (app-team follow-up)
+#   unresolved           : live connection seen but the APP was not identified this scan
+#                          (container churned between scan steps, or CF record unreadable) ->
+#                          data gap, re-run to resolve; NOT the same as unknown
 cmd_classify(){
   local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
   [ -s "$apps" ]  || die "no $apps; run resolve first"
@@ -467,8 +470,11 @@ cmd_classify(){
       fi
     fi
 
-    if [ "$ag" = "?" ] || [ -z "$ag" ]; then
-      method="unknown"
+    # unresolved: we saw a live connection but never got a usable app identity this scan
+    # (container churned between scan steps, or its CF record was unreadable). This is a
+    # DATA gap to re-run, NOT "redis is hidden" -- keep it distinct from unknown.
+    if [ "$ag" = "?" ] || [ -z "$ag" ] || [ "$name" = "UNRESOLVED" ] || [ "$name" = "?" ]; then
+      method="unresolved"
     else
       # 1) binding to THIS instance? (only checkable if we resolved the service GUID)
       bcount=0
@@ -476,10 +482,13 @@ cmd_classify(){
       if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then
         method="cf-bind"
       else
-        # precise redis signals: redis IP, deployment name (appears in .bosh DNS refs), a
-        # redis:// URL, or a REDIS host/url key. (Bare port omitted -- too false-positive-prone.)
-        local pat="${rip//./\\.}|redis://|REDIS[_A-Z0-9]*(HOST|URL|URI|ADDR)"
+        # precise redis/valkey signals (anchored to keep false positives low):
+        #   - the redis IP; the deployment name (.bosh DNS) and service-instance GUID
+        #   - a redis://|rediss://|valkey://|valkeys:// URL (incl. TLS)
+        #   - a REDIS*/VALKEY* host/url/endpoint/server/node/port key
+        local pat="${rip//./\\.}|(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)"
         [ "$dep" != "?" ] && [ -n "$dep" ] && pat="$pat|${dep}"
+        [ -n "$si" ] && pat="$pat|${si}"          # service-instance GUID: 36-char, very low false-positive
         # 2) in the app's ENV VARS? (manifest env: block or `cf set-env`) -> env-var
         if timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null | grep -qiE "$pat" 2>/dev/null; then
           method="static-ref: env-var"

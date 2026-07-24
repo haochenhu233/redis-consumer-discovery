@@ -84,7 +84,8 @@ The **`method`** column tells you what each app needs at migration:
 | `cf-bind` | Standard service binding. | Auto-migrates. No app-team action. |
 | `static-ref: env-var` | Redis address is set in the app's environment variables. | Update the env var to the new Valkey details. |
 | `static-ref: manifest` | Redis address is on the app's start command / sidecar. | Update the manifest and re-push. |
-| `unknown` | App connects, but the Redis details aren't visible to the platform (e.g. in an app config file or an external config server). | App-team review required. |
+| `unknown` | App **is** identified, but the Redis details aren't visible to the platform (e.g. in an app config file or an external config server). | App-team review required. |
+| `unresolved` | A live connection was seen but the **app couldn't be identified** in this scan (container was rescheduled between scan steps, or its record was momentarily unreadable). | Usually transient — **re-run the scan** to resolve. Not an app-config problem. |
 | `external` | A connection from outside Cloud Foundry (not an app). | Service-owner / firewall review. |
 
 ---
