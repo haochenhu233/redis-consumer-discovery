@@ -71,7 +71,11 @@ After a run, the output folder contains:
 
 ### The final report — `redis_consumers.txt`
 
-Columns: `app_name, space, org, method, redis_service_name, redis_deployment`.
+Columns: `app_name, space, org, method, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
+
+`space`/`org` are where the **app** runs; `redis_service_space`/`redis_service_org` are where the
+**Redis service instance** lives. When they differ, the app is reaching a Redis managed in a
+different space/org — worth flagging for migration ownership.
 
 The **`method`** column tells you what each app needs at migration:
 

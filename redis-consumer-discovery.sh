@@ -227,6 +227,21 @@ cmd_run(){
   echo; echo "== done :: $OUT/redis_consumers.txt =="
 }
 
+# reclassify: re-run phase 2 (sweep -> resolve -> classify -> report) from an EXISTING
+# 02_conns.tsv, WITHOUT re-scanning any redis. Use this to re-derive the report after a
+# long census (e.g. widened classification, added columns) -- the slow redis census is reused.
+# Sweep is parallel (RCD_PAR) so this is fast.
+cmd_reclassify(){
+  [ -s "$OUT/02_conns.tsv" ] || die "no $OUT/02_conns.tsv to reclassify (run census/run first, or point <output-dir> at a prior scan)"
+  local nconn; nconn=$(($(wc -l < "$OUT/02_conns.tsv") - 1))
+  echo "== reclassify from existing 02_conns.tsv: $nconn connection(s), no redis re-scan =="
+  cmd_sweep || echo "  !! sweep had errors (continuing)"
+  cmd_resolve  || die "resolve failed"
+  cmd_classify || die "classify failed"
+  cmd_report
+  echo; echo "== done :: $OUT/redis_consumers.txt =="
+}
+
 # census: list live client connections to a redis deployment -> $OUT/02_conns.tsv
 # scp's this script to the redis VM and runs _worker-census there (read-only ss).
 cmd_census(){
@@ -260,8 +275,30 @@ cmd_census(){
   return 0                                            # ran successfully even if 0 connections
 }
 
+# _sweep_one: sweep a SINGLE cell in the background. Writes its rows to its own temp
+# file (no lock needed -- one file per cell). scp+ssh are the slow part, so many of
+# these run concurrently (bounded by RCD_PAR). Linux-only cell: Windows cells are
+# filtered out by the caller (they have no bash/nsenter and only error out).
+_sweep_one(){
+  local cip="$1" cslug="$2" redis_ips="$3" outfile="$4"
+  g_cf scp "$SELF" "$cslug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "sweep: scp to $cslug failed"; return 0; }
+  local dbg=""; [ -n "${RCD_DEBUG:-}" ] && dbg="DEBUG"
+  local raw; raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" </dev/null 2>/dev/null | tr -d '\r')
+  [ -n "${RCD_DEBUG:-}" ] && printf '%s\n' "$raw" | grep -oE '#DBG#.*'
+  local n=0 ccip guid rip
+  while IFS=$'\t' read -r ccip guid rip; do
+    [ -z "$ccip" ] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$cip" "$cslug" "$ccip" "$guid" "$rip" >> "$outfile"
+    n=$((n+1))
+  done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+  echo "sweep: cell $cip ($cslug) -> $n container(s)"
+}
+
 # sweep: for each cell in 02_conns.tsv, resolve its containers' connections to redis
 # into (container_ip, CF_INSTANCE_GUID) -> $OUT/03_cellmap.tsv
+# Cells are swept CONCURRENTLY (RCD_PAR at a time, default 8). Windows diego cells are
+# skipped -- they have no bash/nsenter, so sweeping them only errors. The cellmap is
+# rewritten fresh each run so it is safe to re-run (e.g. `reclassify`) without dupes.
 cmd_sweep(){
   local conns="$OUT/02_conns.tsv"
   [ -s "$conns" ] || die "no census file at $conns; run census first"
@@ -274,24 +311,31 @@ cmd_sweep(){
   fi
 
   local f="$OUT/03_cellmap.tsv"
-  [ -s "$f" ] || printf 'env\tcell_ip\tcell_instance\tcontainer_ip\tinstance_guid\tredis_ip\n' > "$f"
+  printf 'env\tcell_ip\tcell_instance\tcontainer_ip\tinstance_guid\tredis_ip\n' > "$f"
 
-  local cip cslug raw n ccip guid rip
+  # fetch the CF vms table ONCE, then resolve each peer IP -> instance slug offline.
+  local vms; vms=$(g_cf vms 2>/dev/null)
+  local par="${RCD_PAR:-8}"
+  local wdir="$OUT/.sweep"; rm -rf "$wdir"; mkdir -p "$wdir"
+  local cip cslug grp vline
+  local launched=0 skipped_win=0 skipped_noslug=0
   for cip in $cell_ips; do
-    cslug=$(cell_slug_for_ip "$cip")
-    [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; continue; }
-    g_cf scp "$SELF" "$cslug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "sweep: scp to $cslug failed"; continue; }
-    local dbg=""; [ -n "${RCD_DEBUG:-}" ] && dbg="DEBUG"
-    raw=$(g_cf ssh "$cslug" -c "sudo bash /tmp/rcd.sh _worker-sweep $dbg $redis_ips" </dev/null 2>/dev/null | tr -d '\r')
-    [ -n "${RCD_DEBUG:-}" ] && printf '%s\n' "$raw" | grep -oE '#DBG#.*'
-    n=0
-    while IFS=$'\t' read -r ccip guid rip; do
-      [ -z "$ccip" ] && continue
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$cip" "$cslug" "$ccip" "$guid" "$rip" >> "$f"
-      n=$((n+1))
-    done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
-    echo "sweep: cell $cip ($cslug) -> $n container(s)"
+    vline=$(printf '%s\n' "$vms" | grep -F "$cip" | head -1)
+    cslug=$(printf '%s' "$vline" \
+      | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; skipped_noslug=$((skipped_noslug+1)); continue; }
+    grp="${cslug%%/*}"
+    case "$grp" in
+      *[Ww][Ii][Nn][Dd][Oo][Ww][Ss]*) echo "sweep: $cip ($cslug) is a windows cell - skipping"; skipped_win=$((skipped_win+1)); continue ;;
+    esac
+    # throttle to RCD_PAR concurrent cells
+    while [ "$(jobs -rp | wc -l)" -ge "$par" ]; do sleep 0.3; done
+    _sweep_one "$cip" "$cslug" "$redis_ips" "$wdir/$cip.tsv" &
+    launched=$((launched+1))
   done
+  wait
+  cat "$wdir"/*.tsv 2>/dev/null >> "$f"
+  echo "sweep: $launched cell(s) swept (par=$par), $skipped_win windows skipped, $skipped_noslug unresolved"
   echo "sweep: results in $f"; column -t -s$'\t' "$f" 2>/dev/null || cat "$f"
 }
 
@@ -392,9 +436,9 @@ cmd_classify(){
   done < "$conns"
 
   local out="$OUT/06_classified.tsv"
-  printf 'env\tapp_name\tspace\torg\tmethod\tredis_service_name\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
-  declare -A SVCNAME
-  local cip guid pg ag name sp org dep si svcname method man bcount
+  printf 'env\tapp_name\tspace\torg\tmethod\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
+  declare -A SVCINFO
+  local cip guid pg ag name sp org dep si svcname svc_space svc_org method man bcount
   while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
     rip=${rip//$'\r'/}; ag=${ag//$'\r'/}; org=${org//$'\r'/}   # defensive: strip stray CR
@@ -402,13 +446,24 @@ cmd_classify(){
     dep="${DEP_BY_IP[$rip]:-?}"
     si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"    # last 36 chars = CF service-instance GUID (empty if dep unresolved)
 
-    # redis service name (cache) -- only when we have a service GUID
-    svcname="?"
+    # redis service instance: name + the space/org IT lives in (cached per service GUID).
+    # Comparing these against the app's own space/org reveals cross-space/cross-org access
+    # (an app reaching a redis managed in a different space/org).
+    svcname="?"; svc_space="?"; svc_org="?"
     if [ -n "$si" ]; then
-      if [ -n "${SVCNAME[$si]:-}" ]; then svcname="${SVCNAME[$si]}"
+      if [ -n "${SVCINFO[$si]:-}" ]; then
+        IFS=$'\t' read -r svcname svc_space svc_org <<< "${SVCINFO[$si]}"
       else
-        svcname=$(timeout 20 cf curl "/v3/service_instances/$si" 2>/dev/null | jq -r '.name // "?"' 2>/dev/null)
-        [ -z "$svcname" ] && svcname="?"; SVCNAME[$si]="$svcname"
+        local sj ssg
+        sj=$(timeout 20 cf curl "/v3/service_instances/$si" 2>/dev/null)
+        svcname=$(printf '%s' "$sj" | jq -r '.name // "?"' 2>/dev/null); [ -z "$svcname" ] && svcname="?"
+        ssg=$(printf '%s' "$sj" | jq -r '.relationships.space.data.guid // ""' 2>/dev/null)
+        if [ -n "$ssg" ]; then
+          IFS=$'\t' read -r svc_space svc_org < <(timeout 20 cf curl "/v3/spaces/$ssg?include=organization" 2>/dev/null \
+            | jq -r '[ (.name // "?"), (.included.organizations[0].name // "?") ] | @tsv' 2>/dev/null)
+          [ -z "$svc_space" ] && svc_space="?"; [ -z "$svc_org" ] && svc_org="?"
+        fi
+        SVCINFO[$si]="$svcname"$'\t'"$svc_space"$'\t'"$svc_org"
       fi
     fi
 
@@ -436,7 +491,7 @@ cmd_classify(){
         fi
       fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$svcname" "$dep" "$ag" "$rip" >> "$out"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
   done < "$apps"
 
   echo "classify: results in $out"
@@ -449,21 +504,25 @@ cmd_report(){
   local cls="$OUT/06_classified.tsv" conns="$OUT/02_conns.tsv" cm="$OUT/03_cellmap.tsv"
   [ -s "$cls" ] || die "no $cls; run classify first"
   local out="$OUT/redis_consumers.txt"
-  echo "app_name,space,org,method,redis_service_name,redis_deployment" > "$out"
+  echo "app_name,space,org,method,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
 
   # resolved rows, deduped by (app_guid,redis_deployment)
-  awk -F'\t' 'NR>1 && $8!="" {
-      key=$8 SUBSEP $7; if (seen[key]++) next;
-      print $2","$3","$4","$5","$6","$7 }' "$cls" >> "$out"
+  awk -F'\t' 'NR>1 && $10!="" {
+      key=$10 SUBSEP $9; if (seen[key]++) next;
+      print $2","$3","$4","$5","$6","$7","$8","$9 }' "$cls" >> "$out"
 
-  # external consumers: census peer IPs not present as a cell in the cellmap
+  # external consumers: census peer IPs not present as a cell in the cellmap.
+  # Fill the redis service name/space/org from the classified rows (keyed by deployment)
+  # so external rows still show which service -- and which space/org -- was reached.
   if [ -s "$conns" ] && [ -s "$cm" ]; then
     local cellips; cellips=$(awk -F'\t' 'NR>1{print $2}' "$cm" | sort -u)
     awk -F'\t' -v cells="$cellips" '
       BEGIN{ n=split(cells,a,"\n"); for(i=1;i<=n;i++) C[a[i]]=1 }
-      NR>1 && $5!="" && !($5 in C) {
+      FNR==NR { if (FNR>1 && $9!="") { svc[$9]=$6; ssp[$9]=$7; sorg[$9]=$8 } next }   # classified: dep -> svc info
+      FNR==1 { next }                                                                # conns header
+      $5!="" && !($5 in C) {
         key=$5 SUBSEP $2; if (seen[key]++) next;
-        print "EXTERNAL(" $5 "),,,external,," $2 }' "$conns" >> "$out"
+        print "EXTERNAL(" $5 "),,,external," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
   fi
 
   echo "report: final CSV in $out"
@@ -554,6 +613,7 @@ _worker_sweep(){
 case "$SUB" in
   preflight)       cmd_preflight ;;
   run)             cmd_run ;;
+  reclassify)      cmd_reclassify ;;
   merge-orphaned)  cmd_merge_orphaned ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
