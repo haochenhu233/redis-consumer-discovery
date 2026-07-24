@@ -346,9 +346,16 @@ cmd_resolve(){
   [ -s "$cm" ] || die "no cellmap at $cm; run sweep first"
   command -v jq >/dev/null || die "jq required on the bastion"
 
-  # 1) dump cfdot actual-lrps from any cell in the cellmap
+  # 1) dump cfdot actual-lrps from any cell in the cellmap.
+  # Header-only cellmap = every peer was external/NAT or a skipped windows cell -> no CF
+  # apps to resolve. Emit an empty apps file and return cleanly so classify/report still
+  # run and produce an external-only report (instead of aborting the whole pass).
   local cell; cell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
-  [ -z "$cell" ] && die "no cell_instance in $cm"
+  if [ -z "$cell" ]; then
+    printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\n' > "$OUT/05_apps.tsv"
+    echo "resolve: no diego cells in cellmap (all external/NAT or windows) - no apps to resolve"
+    return 0
+  fi
   echo "resolve: dumping cfdot actual-lrps from $cell ..."
   g_cf scp "$SELF" "$cell":/tmp/rcd.sh >/dev/null 2>&1 || die "scp worker to $cell failed"
   echo "--- cfdot dump diagnostics (bytes + first stderr lines) ---"
