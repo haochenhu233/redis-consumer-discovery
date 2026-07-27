@@ -68,7 +68,7 @@ After a run, the output folder contains:
 |---|---|---|
 | **`redis_consumers.txt`** | **The final report (CSV).** One row per app↔Redis pair. | **This is the deliverable.** Open in Excel/Sheets. |
 | `orphaned/orphaned-<timestamp>.tsv` | Redis with no consumers in that scan. | Kept for later review; ignore for now. |
-| `02_conns.tsv`, `03_cellmap.tsv`, `04_lrps.*`, `05_apps.tsv`, `06_classified.tsv` | Working files produced along the way. | Diagnostics/support only — ignore for normal use. |
+| `02_conns.tsv`, `03_cellmap.tsv`, `04_lrps.*`, `05_apps.tsv`, `06_classified.tsv`, `redis_ips.tsv` | Working files produced along the way. | Diagnostics/support only — ignore for normal use. |
 
 ### The final report — `redis_consumers.txt`
 

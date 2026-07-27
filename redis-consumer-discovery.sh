@@ -210,6 +210,11 @@ cmd_run(){
   done
   wait
   cat "$cdir"/*.tsv 2>/dev/null >> "$f"                 # merge per-redis results after the barrier
+  # complete redis_ip -> deployment map (covers IDLE redis too, so static_ref_target resolves).
+  local ipmap="$OUT/redis_ips.tsv"
+  [ -n "${RCD_RESUME:-}" ] || : > "$ipmap"              # fresh unless resuming
+  cat "$cdir"/*.ipmap 2>/dev/null >> "$ipmap"
+  [ -s "$ipmap" ] && sort -u "$ipmap" -o "$ipmap"
   echo "== census pass: $launched censused (par=$par), $skipped skipped of $total =="
 
   # orphaned snapshot: every discovered redis with 0 live connections THIS scan (timestamped).
@@ -285,6 +290,12 @@ _census_one(){
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$dep" "$rip" "$rport" "$pip" "$pport" >> "$outfile"
     n=$((n+1))
   done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+  # this redis VM's IP(s) -> dep, so an idle redis (0 connections) still maps ip->deployment
+  local _ip
+  while IFS= read -r _ip; do
+    [ -z "$_ip" ] && continue
+    printf '%s\t%s\n' "$dep" "$_ip" >> "${outfile}.ipmap"
+  done < <(printf '%s\n' "$raw" | grep -oE '#RCDIP#.*' | cut -f2-)
   echo "census: $dep -> $n live connection(s)"
 }
 
@@ -297,6 +308,9 @@ cmd_census(){
   local tmp="$OUT/.census-single.$$.tmp"; : > "$tmp"
   _census_one "$REDIS_DEP" "$tmp"
   cat "$tmp" >> "$f" 2>/dev/null; rm -f "$tmp"
+  if [ -f "${tmp}.ipmap" ]; then
+    cat "${tmp}.ipmap" >> "$OUT/redis_ips.tsv"; sort -u "$OUT/redis_ips.tsv" -o "$OUT/redis_ips.tsv"; rm -f "${tmp}.ipmap"
+  fi
   return 0
 }
 
@@ -481,7 +495,7 @@ cmd_classify(){
   [ -s "$conns" ] || die "no $conns; run census first"
   command -v jq >/dev/null || die "jq required"
 
-  # redis_ip -> redis_dep (from census)
+  # redis_ip -> redis_dep (from census connections)
   declare -A DEP_BY_IP
   local e rd rip rport pip pport
   while IFS=$'\t' read -r e rd rip rport pip pport; do
@@ -490,6 +504,16 @@ cmd_classify(){
     [ -z "$rip" ] && continue
     DEP_BY_IP["$rip"]="$rd"
   done < "$conns"
+  # supplement with the complete redis_ip->dep map (covers IDLE redis with 0 connections), so a
+  # static_ref_target pointing at an idle redis still resolves to its service name.
+  if [ -s "$OUT/redis_ips.tsv" ]; then
+    local mdep mip
+    while IFS=$'\t' read -r mdep mip; do
+      mdep=${mdep//$'\r'/}; mip=${mip//$'\r'/}
+      [ -z "$mip" ] && continue
+      [ -z "${DEP_BY_IP[$mip]:-}" ] && DEP_BY_IP["$mip"]="$mdep"
+    done < "$OUT/redis_ips.tsv"
+  fi
 
   local out="$OUT/06_classified.tsv"
   printf 'env\tapp_name\tspace\torg\tmethod\tstatic_ref\tstatic_ref_target\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
@@ -624,8 +648,11 @@ cmd_report(){
 }
 
 # _worker-census: RUNS ON the redis VM as root. Read-only. Emits #RCD#-tagged TSV:
-#   #RCD# <redis_ip> <redis_port> <peer_ip> <peer_port>
+#   #RCD#   <redis_ip> <redis_port> <peer_ip> <peer_port>   (one per live client connection)
+#   #RCDIP# <redis_ip>                                       (this VM's own IP(s), always)
 # Kernel ss (immune to rename-command hardening). Finds the real port(s) incl TLS.
+# The #RCDIP# lines let the orchestrator map redis_ip->deployment even for an IDLE redis
+# (0 connections), which is what lets static_ref_target resolve to a service name.
 _worker_census(){
   local ports p
   ports=$(ss -Htnlp 2>/dev/null | grep -iE 'redis|valkey' | grep -oE ':[0-9]+' | tr -d ':' | sort -un)
@@ -637,6 +664,10 @@ _worker_census(){
               if (li>0 && pi>0)
                 printf "#RCD#\t%s\t%s\t%s\t%s\n", substr(loc,1,li-1), p, substr(peer,1,pi-1), substr(peer,pi+1) }'
   done
+  # this VM's own global IPv4 address(es) -> lets idle redis still map ip->deployment
+  { hostname -I 2>/dev/null | tr ' ' '\n'; ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1; } \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^127\.' | sort -u \
+    | while IFS= read -r _ip; do printf '#RCDIP#\t%s\n' "$_ip"; done
   echo "#RCD-DONE#"                                   # sentinel: proves the worker actually ran
 }
 # _worker-sweep <redis_ip...>: RUNS ON a diego cell as root. Read-only.
