@@ -49,6 +49,7 @@ Options (prepend or append as needed):
 
 | Option | Effect |
 |---|---|
+| `RCD_PAR=<n> bash ... run <env>` | How many Redis/cells to scan **concurrently** (default 8). Raise for speed, lower if the director is strained. |
 | `RCD_RESUME=1 bash ... run <env>` | Continue an interrupted scan; skip Redis already done. |
 | `RCD_INCLUDE_VALKEY=1 bash ... run <env>` | Also scan Valkey (default: Redis only). |
 | `... run <env> --redis <deployment>` | Scan a single Redis deployment (spot check). |

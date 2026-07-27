@@ -183,19 +183,34 @@ cmd_run(){
 
   [ -z "${RCD_RESUME:-}" ] && rm -f "$OUT/02_conns.tsv" "$OUT/03_cellmap.tsv"
 
-  echo "== phase 1/2: census ALL $total redis (each isolated; failures skip, never abort) =="
-  local i=0 d ok=0 fail=0 DEPS=()
+  local par="${RCD_PAR:-8}"
+  echo "== phase 1/2: census ALL $total redis CONCURRENTLY (par=$par; each isolated; failures skip, never abort) =="
+  local i=0 d DEPS=()
   mapfile -t DEPS < <(printf '%s\n' "$deps")           # read into an array first; ssh in the loop
-  for d in "${DEPS[@]}"; do                             # would otherwise consume a piped stream
+  local f="$OUT/02_conns.tsv"
+  # fresh header on a normal run; keep the existing file (and skip done deps) when resuming
+  if [ -n "${RCD_RESUME:-}" ] && [ -s "$f" ]; then
+    echo "resume: keeping existing $f; already-censused redis will be skipped"
+  else
+    printf 'env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port\n' > "$f"
+  fi
+  local cdir="$OUT/.census"; rm -rf "$cdir"; mkdir -p "$cdir"
+  local launched=0 skipped=0
+  for d in "${DEPS[@]}"; do
     [ -z "$d" ] && continue
     i=$((i+1))
-    if [ -n "${RCD_RESUME:-}" ] && [ -s "$OUT/02_conns.tsv" ] && grep -qF "$d" "$OUT/02_conns.tsv"; then
-      echo "[$i/$total] census $d :: SKIP (already censused)"; continue
+    if [ -n "${RCD_RESUME:-}" ] && grep -qF "$d" "$f"; then
+      echo "[$i/$total] census $d :: SKIP (already censused)"; skipped=$((skipped+1)); continue
     fi
-    echo "[$i/$total] census $d"
-    if ( REDIS_DEP="$d"; cmd_census ); then ok=$((ok+1)); else fail=$((fail+1)); echo "  !! census error for $d (continuing)"; fi
+    # throttle to RCD_PAR concurrent censuses
+    while [ "$(jobs -rp | wc -l)" -ge "$par" ]; do sleep 0.3; done
+    echo "[$i/$total] census $d (queued)"
+    _census_one "$d" "$cdir/$d.tsv" &
+    launched=$((launched+1))
   done
-  echo "== census pass: $ok ran, $fail hard-errored (skipped) of $total =="
+  wait
+  cat "$cdir"/*.tsv 2>/dev/null >> "$f"                 # merge per-redis results after the barrier
+  echo "== census pass: $launched censused (par=$par), $skipped skipped of $total =="
 
   # orphaned snapshot: every discovered redis with 0 live connections THIS scan (timestamped).
   # Merge across days (merge-orphaned) to find redis unused in EVERY scan = truly orphaned.
@@ -242,37 +257,47 @@ cmd_reclassify(){
   echo; echo "== done :: $OUT/redis_consumers.txt =="
 }
 
-# census: list live client connections to a redis deployment -> $OUT/02_conns.tsv
-# scp's this script to the redis VM and runs _worker-census there (read-only ss).
-cmd_census(){
-  [ -z "$REDIS_DEP" ] && die "census requires --redis <dep>"
-  local slug; slug=$(dep_slug "$REDIS_DEP")
+# _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
+# no shared-file append, so many run concurrently). Emits rows WITHOUT a header:
+#   env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port
+# Always returns 0 (soft-fail): prints a one-line reason and leaves outfile empty on any error,
+# so one bad redis never aborts the batch.
+_census_one(){
+  local dep="$1" outfile="$2"
+  local slug; slug=$(dep_slug "$dep")
   # orphaned redis (index entry but no BOSH deployment/VM) -> skip gracefully, don't abort a run
-  [ -z "$slug" ] && { echo "census: $REDIS_DEP has no instances (orphaned / no deployment) - skipping"; return 0; }
-  g_dir -d "$REDIS_DEP" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "census: scp to $slug failed (VM down?) - skipping"; return 0; }
+  [ -z "$slug" ] && { echo "census: $dep has no instances (orphaned / no deployment) - skipping"; return 0; }
+  g_dir -d "$dep" scp "$SELF" "$slug":/tmp/rcd.sh >/dev/null 2>&1 || { echo "census: scp to $slug failed (VM down?) - skipping"; return 0; }
   # tr -d '\r': bosh ssh returns CRLF; strip it so it never enters the data (else IP keys carry \r)
-  # </dev/null: bosh ssh reads stdin; without this it eats the caller's loop input (only 1 of N runs)
-  local raw; raw=$(g_dir -d "$REDIS_DEP" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' </dev/null 2>/dev/null | tr -d '\r')
+  # </dev/null: bosh ssh reads stdin; without this it eats the caller's loop input
+  local raw; raw=$(g_dir -d "$dep" ssh -c 'sudo bash /tmp/rcd.sh _worker-census' </dev/null 2>/dev/null | tr -d '\r')
 
   # distinguish worker-ran-but-empty from ssh/worker failure via the sentinel
   if ! printf '%s' "$raw" | grep -q '#RCD-DONE#'; then
     local hint; hint=$(printf '%s' "$raw" | grep -vE '^\s*$' | head -1)
-    echo "census: $REDIS_DEP -> worker did not complete (ssh/timeout/perm) - skipping${hint:+  [$hint]}"
+    echo "census: $dep -> worker did not complete (ssh/timeout/perm) - skipping${hint:+  [$hint]}"
     return 0
   fi
 
-  local f="$OUT/02_conns.tsv"
-  [ -s "$f" ] || printf 'env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port\n' > "$f"
   local n=0 rip rport pip pport
   while IFS=$'\t' read -r rip rport pip pport; do
     [ -z "$rip" ] && continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$REDIS_DEP" "$rip" "$rport" "$pip" "$pport" >> "$f"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$dep" "$rip" "$rport" "$pip" "$pport" >> "$outfile"
     n=$((n+1))
   done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+  echo "census: $dep -> $n live connection(s)"
+}
 
-  echo "census: $REDIS_DEP -> $n live connection(s)  (appended to $f)"
-  printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2- | sed 's/^/  redis_ip=/;s/\t/ port=/;s/\t/ peer=/;s/\t/:/' || true
-  return 0                                            # ran successfully even if 0 connections
+# census: list live client connections to ONE redis deployment -> appends to $OUT/02_conns.tsv
+# (single-deployment subcommand; the parallel batch in cmd_run calls _census_one directly.)
+cmd_census(){
+  [ -z "$REDIS_DEP" ] && die "census requires --redis <dep>"
+  local f="$OUT/02_conns.tsv"
+  [ -s "$f" ] || printf 'env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port\n' > "$f"
+  local tmp="$OUT/.census-single.$$.tmp"; : > "$tmp"
+  _census_one "$REDIS_DEP" "$tmp"
+  cat "$tmp" >> "$f" 2>/dev/null; rm -f "$tmp"
+  return 0
 }
 
 # _sweep_one: sweep a SINGLE cell in the background. Writes its rows to its own temp
