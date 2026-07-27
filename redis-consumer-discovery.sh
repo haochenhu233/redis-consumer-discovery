@@ -443,6 +443,20 @@ cmd_resolve(){
   echo "resolve: results in $out"
   column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
 }
+# _extract_redis_hosts <blob>: emit candidate redis host/IP tokens (one per line) found in a
+# CF env-vars JSON or manifest YAML blob -- values of REDIS*/VALKEY* host-ish keys, and the
+# host inside redis://[user:pass@]host[:port] URLs. Best-effort; used to show WHERE a static
+# reference points when it is not this row's redis.
+_extract_redis_hosts(){
+  local blob="$1"
+  printf '%s' "$blob" \
+    | grep -oiE '(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|ADDR|SERVER|NODE)"?[[:space:]]*[:=][[:space:]]*"?[^",}[:space:]]+' \
+    | sed -E 's/.*[:=][[:space:]]*"?//'
+  printf '%s' "$blob" \
+    | grep -oiE '(redis|valkey)s?://[^",}[:space:]]+' \
+    | sed -E 's#^[a-zA-Z]+://##; s#^[^@]*@##; s#[:/].*$##'
+}
+
 # classify: assign a migration method per resolved app+redis -> $OUT/06_classified.tsv
 #   cf-bind    : app has a binding to THIS redis service instance (auto-migrates)
 #   static-ref: env-var  : redis appears in the app's environment variables (manifest env: block
@@ -458,6 +472,9 @@ cmd_resolve(){
 # INDEPENDENTLY (even for cf-bind apps): a bound app that ALSO hardcodes REDIS_HOST/URL will
 # NOT cut over on rebind (its static creds still point at the old redis) -> migration hazard.
 # So `method=cf-bind` + `static_ref=env-var` is the "looks safe but isn't" case to chase down.
+# `static_ref_target` disambiguates WHICH redis the static reference points at when it is NOT
+# this row's redis (env/manifest target host != this redis IP), resolved to a service name if
+# that target is itself a censused redis. Blank = the static ref matches this row's redis.
 cmd_classify(){
   local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
   [ -s "$apps" ]  || die "no $apps; run resolve first"
@@ -475,9 +492,10 @@ cmd_classify(){
   done < "$conns"
 
   local out="$OUT/06_classified.tsv"
-  printf 'env\tapp_name\tspace\torg\tmethod\tstatic_ref\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
+  printf 'env\tapp_name\tspace\torg\tmethod\tstatic_ref\tstatic_ref_target\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
   declare -A SVCINFO ENVDATA MANDATA
   local cip guid pg ag name sp org dep si svcname svc_space svc_org method man bcount staticref in_env in_man
+  local strTarget _hosts _h _div _odep _osi _osvc
   while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
     rip=${rip//$'\r'/}; ag=${ag//$'\r'/}; org=${org//$'\r'/}   # defensive: strip stray CR
@@ -534,13 +552,40 @@ cmd_classify(){
       # an env match shows up in both -- attribute it to env-var, not manifest).
       if [ -n "$in_env" ]; then staticref="env-var"; elif [ -n "$in_man" ]; then staticref="manifest"; fi
 
+      # static_ref_target: when the app statically references a redis, find the target host it
+      # points at; if that host is NOT this row's redis IP, surface it (resolved to a service
+      # name when the target IP is itself a censused redis). Blank => points at THIS redis.
+      strTarget=""
+      if [ -n "$in_env$in_man" ]; then
+        _hosts=$(_extract_redis_hosts "${ENVDATA[$ag]}"; _extract_redis_hosts "${MANDATA[$ag]}")
+        _div=""
+        while IFS= read -r _h; do
+          _h="${_h%%[[:space:]]*}"; [ -z "$_h" ] && continue
+          [ "$_h" = "$rip" ] && continue                 # matches this row's redis -> consistent
+          _div="$_h"; break                               # first host that differs -> the target
+        done <<< "$_hosts"
+        if [ -n "$_div" ]; then
+          if [ -n "${DEP_BY_IP[$_div]:-}" ]; then         # target IP is itself a censused redis
+            _odep="${DEP_BY_IP[$_div]}"; _osi=""; [ "${#_odep}" -ge 36 ] && _osi="${_odep: -36}"
+            _osvc="?"
+            if [ -n "$_osi" ]; then
+              if [ -n "${SVCINFO[$_osi]:-}" ]; then IFS=$'\t' read -r _osvc _ _ <<< "${SVCINFO[$_osi]}"
+              else _osvc=$(timeout 20 cf curl "/v3/service_instances/$_osi" 2>/dev/null | jq -r '.name // "?"' 2>/dev/null); [ -z "$_osvc" ] && _osvc="?"; fi
+            fi
+            strTarget="$_div [$_osvc]"
+          else
+            strTarget="$_div"
+          fi
+        fi
+      fi
+
       # primary method: bind wins; else the static reference; else nothing visible -> unknown
       if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then method="cf-bind"
       elif [ "$staticref" = "env-var" ];  then method="static-ref: env-var"
       elif [ "$staticref" = "manifest" ]; then method="static-ref: manifest"
       else method="unknown"; fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$staticref" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$staticref" "$strTarget" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
   done < "$apps"
 
   echo "classify: results in $out"
@@ -553,12 +598,12 @@ cmd_report(){
   local cls="$OUT/06_classified.tsv" conns="$OUT/02_conns.tsv" cm="$OUT/03_cellmap.tsv"
   [ -s "$cls" ] || die "no $cls; run classify first"
   local out="$OUT/redis_consumers.txt"
-  echo "app_name,space,org,method,static_ref,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
+  echo "app_name,space,org,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
 
   # resolved rows, deduped by (app_guid,redis_deployment)
-  awk -F'\t' 'NR>1 && $11!="" {
-      key=$11 SUBSEP $10; if (seen[key]++) next;
-      print $2","$3","$4","$5","$6","$7","$8","$9","$10 }' "$cls" >> "$out"
+  awk -F'\t' 'NR>1 && $12!="" {
+      key=$12 SUBSEP $11; if (seen[key]++) next;
+      print $2","$3","$4","$5","$6","$7","$8","$9","$10","$11 }' "$cls" >> "$out"
 
   # external consumers: census peer IPs not present as a cell in the cellmap.
   # Fill the redis service name/space/org from the classified rows (keyed by deployment)
@@ -567,11 +612,11 @@ cmd_report(){
     local cellips; cellips=$(awk -F'\t' 'NR>1{print $2}' "$cm" | sort -u)
     awk -F'\t' -v cells="$cellips" '
       BEGIN{ n=split(cells,a,"\n"); for(i=1;i<=n;i++) C[a[i]]=1 }
-      FNR==NR { if (FNR>1 && $10!="") { svc[$10]=$7; ssp[$10]=$8; sorg[$10]=$9 } next }   # classified: dep -> svc info
+      FNR==NR { if (FNR>1 && $11!="") { svc[$11]=$8; ssp[$11]=$9; sorg[$11]=$10 } next }  # classified: dep -> svc info
       FNR==1 { next }                                                                    # conns header
       $5!="" && !($5 in C) {
         key=$5 SUBSEP $2; if (seen[key]++) next;
-        print "EXTERNAL(" $5 "),,,external,," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
+        print "EXTERNAL(" $5 "),,,external,,," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
   fi
 
   echo "report: final CSV in $out"

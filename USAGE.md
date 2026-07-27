@@ -72,7 +72,7 @@ After a run, the output folder contains:
 
 ### The final report — `redis_consumers.txt`
 
-Columns: `app_name, space, org, method, static_ref, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
+Columns: `app_name, space, org, method, static_ref, static_ref_target, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
 
 `space`/`org` are where the **app** runs; `redis_service_space`/`redis_service_org` are where the
 **Redis service instance** lives. When they differ, the app is reaching a Redis managed in a
@@ -84,6 +84,16 @@ the Redis address (in env vars or its manifest), even when it's bound. **A row w
 auto-migrate to Valkey, but the hardcoded env var will still point at the old Redis, so the app
 may keep using the dead Redis after cutover. These need the env var updated, not just a rebind.
 Filter for them first: `method=cf-bind` **and** `static_ref` not empty.
+
+`static_ref_target` tells you **which** Redis the hardcoded reference points at, but only when
+it is **different** from this row's Redis:
+- **blank** → the static reference points at *this* row's Redis (the hardcoded address matches, or
+  couldn't be extracted). This is the normal in-place hazard above.
+- **an address (e.g. `10.0.0.9 [other-cache]`)** → the app is bound to *this* Redis but its env
+  var/manifest points at a **different** Redis (shown resolved to that service's name when it's
+  one we scanned). These apps span two Redis services — migrate/repoint both, and confirm which
+  one the app actually uses. A bare hostname here means the target couldn't be matched to a
+  scanned Redis by IP — verify it manually.
 
 The **`method`** column tells you what each app needs at migration:
 
