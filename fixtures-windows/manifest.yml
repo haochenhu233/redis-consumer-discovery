@@ -1,0 +1,16 @@
+applications:
+- name: rcd-fix-win-bind
+  stack: windows                 # confirm the exact name with `cf stacks` (may be windows2019)
+  buildpacks: [binary_buildpack]
+  command: powershell -ExecutionPolicy Bypass -File .\keepalive.ps1
+  memory: 512M                   # windows containers are heavy; bump to 1G if it won't start
+  instances: 1
+  health-check-type: process     # no web port -- it's a keep-alive, not a server
+  no-route: true
+  # cf-bind variant: bind a real redis service instance (VCAP_SERVICES path in keepalive.ps1)
+  services:
+  - REPLACE_WITH_REDIS_SERVICE
+  # --- static/env-var variant instead of `services:` above ---
+  # env:
+  #   REDIS_HOST: "10.x.x.x"     # a redis VM IP
+  #   REDIS_PORT: "6379"
