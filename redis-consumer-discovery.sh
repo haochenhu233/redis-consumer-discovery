@@ -454,6 +454,10 @@ cmd_resolve(){
 #   unresolved           : live connection seen but the APP was not identified this scan
 #                          (container churned between scan steps, or CF record unreadable) ->
 #                          data gap, re-run to resolve; NOT the same as unknown
+# The `method` is the PRIMARY mechanism (bind wins). A separate `static_ref` column is filled
+# INDEPENDENTLY (even for cf-bind apps): a bound app that ALSO hardcodes REDIS_HOST/URL will
+# NOT cut over on rebind (its static creds still point at the old redis) -> migration hazard.
+# So `method=cf-bind` + `static_ref=env-var` is the "looks safe but isn't" case to chase down.
 cmd_classify(){
   local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
   [ -s "$apps" ]  || die "no $apps; run resolve first"
@@ -471,9 +475,9 @@ cmd_classify(){
   done < "$conns"
 
   local out="$OUT/06_classified.tsv"
-  printf 'env\tapp_name\tspace\torg\tmethod\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
-  declare -A SVCINFO
-  local cip guid pg ag name sp org dep si svcname svc_space svc_org method man bcount
+  printf 'env\tapp_name\tspace\torg\tmethod\tstatic_ref\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
+  declare -A SVCINFO ENVDATA MANDATA
+  local cip guid pg ag name sp org dep si svcname svc_space svc_org method man bcount staticref in_env in_man
   while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
     rip=${rip//$'\r'/}; ag=${ag//$'\r'/}; org=${org//$'\r'/}   # defensive: strip stray CR
@@ -505,34 +509,38 @@ cmd_classify(){
     # unresolved: we saw a live connection but never got a usable app identity this scan
     # (container churned between scan steps, or its CF record was unreadable). This is a
     # DATA gap to re-run, NOT "redis is hidden" -- keep it distinct from unknown.
+    staticref=""
     if [ "$ag" = "?" ] || [ -z "$ag" ] || [ "$name" = "UNRESOLVED" ] || [ "$name" = "?" ]; then
       method="unresolved"
     else
-      # 1) binding to THIS instance? (only checkable if we resolved the service GUID)
+      # binding to THIS instance? (only checkable if we resolved the service GUID)
       bcount=0
       [ -n "$si" ] && bcount=$(timeout 20 cf curl "/v3/service_credential_bindings?app_guids=$ag&service_instance_guids=$si&per_page=1" 2>/dev/null | jq -r '.pagination.total_results // 0' 2>/dev/null)
-      if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then
-        method="cf-bind"
-      else
-        # precise redis/valkey signals (anchored to keep false positives low):
-        #   - the redis IP; the deployment name (.bosh DNS) and service-instance GUID
-        #   - a redis://|rediss://|valkey://|valkeys:// URL (incl. TLS)
-        #   - a REDIS*/VALKEY* host/url/endpoint/server/node/port key
-        local pat="${rip//./\\.}|(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)"
-        [ "$dep" != "?" ] && [ -n "$dep" ] && pat="$pat|${dep}"
-        [ -n "$si" ] && pat="$pat|${si}"          # service-instance GUID: 36-char, very low false-positive
-        # 2) in the app's ENV VARS? (manifest env: block or `cf set-env`) -> env-var
-        if timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null | grep -qiE "$pat" 2>/dev/null; then
-          method="static-ref: env-var"
-        # 3) elsewhere in the reconstructed manifest (command:, sidecars:), not in env -> manifest
-        elif timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null | grep -qiE "$pat" 2>/dev/null; then
-          method="static-ref: manifest"
-        else
-          method="unknown"
-        fi
-      fi
+
+      # static redis/valkey signal -- computed ALWAYS (even for cf-bind), so a bound app that
+      # ALSO hardcodes redis is flagged (it won't cut over on rebind). Fetch env+manifest once
+      # per app_guid and cache them; the per-redis pattern match is a cheap local grep.
+      # precise signals (anchored to keep false positives low): redis IP, deployment name
+      # (.bosh DNS), service GUID, a redis://|rediss://|valkey(s):// URL, or a REDIS*/VALKEY* key.
+      local pat="${rip//./\\.}|(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)"
+      [ "$dep" != "?" ] && [ -n "$dep" ] && pat="$pat|${dep}"
+      [ -n "$si" ] && pat="$pat|${si}"
+      [ -n "${ENVDATA[$ag]+x}" ] || ENVDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
+      [ -n "${MANDATA[$ag]+x}" ] || MANDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
+      in_env=""; in_man=""
+      printf '%s' "${ENVDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_env=1
+      printf '%s' "${MANDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_man=1
+      # env-var wins over manifest (the reconstructed manifest also contains the env: block, so
+      # an env match shows up in both -- attribute it to env-var, not manifest).
+      if [ -n "$in_env" ]; then staticref="env-var"; elif [ -n "$in_man" ]; then staticref="manifest"; fi
+
+      # primary method: bind wins; else the static reference; else nothing visible -> unknown
+      if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then method="cf-bind"
+      elif [ "$staticref" = "env-var" ];  then method="static-ref: env-var"
+      elif [ "$staticref" = "manifest" ]; then method="static-ref: manifest"
+      else method="unknown"; fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$staticref" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
   done < "$apps"
 
   echo "classify: results in $out"
@@ -545,12 +553,12 @@ cmd_report(){
   local cls="$OUT/06_classified.tsv" conns="$OUT/02_conns.tsv" cm="$OUT/03_cellmap.tsv"
   [ -s "$cls" ] || die "no $cls; run classify first"
   local out="$OUT/redis_consumers.txt"
-  echo "app_name,space,org,method,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
+  echo "app_name,space,org,method,static_ref,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
 
   # resolved rows, deduped by (app_guid,redis_deployment)
-  awk -F'\t' 'NR>1 && $10!="" {
-      key=$10 SUBSEP $9; if (seen[key]++) next;
-      print $2","$3","$4","$5","$6","$7","$8","$9 }' "$cls" >> "$out"
+  awk -F'\t' 'NR>1 && $11!="" {
+      key=$11 SUBSEP $10; if (seen[key]++) next;
+      print $2","$3","$4","$5","$6","$7","$8","$9","$10 }' "$cls" >> "$out"
 
   # external consumers: census peer IPs not present as a cell in the cellmap.
   # Fill the redis service name/space/org from the classified rows (keyed by deployment)
@@ -559,11 +567,11 @@ cmd_report(){
     local cellips; cellips=$(awk -F'\t' 'NR>1{print $2}' "$cm" | sort -u)
     awk -F'\t' -v cells="$cellips" '
       BEGIN{ n=split(cells,a,"\n"); for(i=1;i<=n;i++) C[a[i]]=1 }
-      FNR==NR { if (FNR>1 && $9!="") { svc[$9]=$6; ssp[$9]=$7; sorg[$9]=$8 } next }   # classified: dep -> svc info
-      FNR==1 { next }                                                                # conns header
+      FNR==NR { if (FNR>1 && $10!="") { svc[$10]=$7; ssp[$10]=$8; sorg[$10]=$9 } next }   # classified: dep -> svc info
+      FNR==1 { next }                                                                    # conns header
       $5!="" && !($5 in C) {
         key=$5 SUBSEP $2; if (seen[key]++) next;
-        print "EXTERNAL(" $5 "),,,external," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
+        print "EXTERNAL(" $5 "),,,external,," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
   fi
 
   echo "report: final CSV in $out"

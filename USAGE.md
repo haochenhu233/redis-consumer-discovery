@@ -72,11 +72,18 @@ After a run, the output folder contains:
 
 ### The final report — `redis_consumers.txt`
 
-Columns: `app_name, space, org, method, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
+Columns: `app_name, space, org, method, static_ref, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
 
 `space`/`org` are where the **app** runs; `redis_service_space`/`redis_service_org` are where the
 **Redis service instance** lives. When they differ, the app is reaching a Redis managed in a
 different space/org — worth flagging for migration ownership.
+
+`static_ref` is filled **independently of `method`**: it says whether the app *also* hardcodes
+the Redis address (in env vars or its manifest), even when it's bound. **A row with
+`method = cf-bind` and `static_ref = env-var` is a migration hazard** — the binding will
+auto-migrate to Valkey, but the hardcoded env var will still point at the old Redis, so the app
+may keep using the dead Redis after cutover. These need the env var updated, not just a rebind.
+Filter for them first: `method=cf-bind` **and** `static_ref` not empty.
 
 The **`method`** column tells you what each app needs at migration:
 
