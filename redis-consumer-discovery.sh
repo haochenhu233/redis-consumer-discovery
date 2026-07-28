@@ -419,7 +419,7 @@ cmd_resolve(){
   # to resolve. Emit an empty apps file and return cleanly so classify/report still run.
   local anycell; anycell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
   if [ -z "$anycell" ]; then
-    printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\n' > "$OUT/05_apps.tsv"
+    printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\tplatform\n' > "$OUT/05_apps.tsv"
     echo "resolve: no diego cells in cellmap (all external/NAT or windows) - no apps to resolve"
     return 0
   fi
@@ -467,13 +467,14 @@ cmd_resolve(){
 
   # 3) walk cellmap, resolve each container to an app (cache CF API lookups)
   local out="$OUT/05_apps.tsv"
-  printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\n' > "$out"
+  printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\tplatform\n' > "$out"
   declare -A APP_CACHE
-  local e cip guid rip cinst cell_ip cid
+  local e cip guid rip cinst cell_ip cid plat
   while IFS=$'\t' read -r e cell_ip cinst cip guid rip; do
     [ "$e" = env ] && continue
     [ -z "$e" ] && continue
     cid="${cinst##*/}"                            # cell_id = uuid part of the instance slug
+    plat="linux"; case "$cinst" in *[Ww][Ii][Nn][Dd][Oo][Ww][Ss]*) plat="windows" ;; esac
     pg="${PG_BY_IG[$guid]:-}"                     # 1) instance_guid (linux; globally unique)
     [ -z "$pg" ] && [ -n "$cid" ] && pg="${PG_BY_CELLIP["$cid $cip"]:-}"   # 2) (cell,container_ip) -- windows-safe
     [ -z "$pg" ] && pg="${PG_BY_IA[$cip]:-}"      # 3) bare container IP (linux fallback)
@@ -505,7 +506,7 @@ cmd_resolve(){
     else
       ag="?"; name="UNRESOLVED"; sp="?"; org="?"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$rip" "$cip" "$guid" "${pg:-?}" "$ag" "$name" "$sp" "$org" >> "$out"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$rip" "$cip" "$guid" "${pg:-?}" "$ag" "$name" "$sp" "$org" "$plat" >> "$out"
   done < "$cm"
 
   echo "resolve: results in $out"
@@ -570,11 +571,11 @@ cmd_classify(){
   fi
 
   local out="$OUT/06_classified.tsv"
-  printf 'env\tapp_name\tspace\torg\tmethod\tstatic_ref\tstatic_ref_target\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
+  printf 'env\tapp_name\tspace\torg\tplatform\tmethod\tstatic_ref\tstatic_ref_target\tredis_service_name\tredis_service_space\tredis_service_org\tredis_deployment\tapp_guid\tredis_ip\n' > "$out"
   declare -A SVCINFO ENVDATA MANDATA
-  local cip guid pg ag name sp org dep si svcname svc_space svc_org method man bcount staticref in_env in_man
+  local cip guid pg ag name sp org platform dep si svcname svc_space svc_org method man bcount staticref in_env in_man
   local strTarget _hosts _h _div _odep _osi _osvc
-  while IFS=$'\t' read -r e rip cip guid pg ag name sp org; do
+  while IFS=$'\t' read -r e rip cip guid pg ag name sp org platform; do
     [ "$e" = env ] && continue; [ -z "$e" ] && continue
     rip=${rip//$'\r'/}; ag=${ag//$'\r'/}; org=${org//$'\r'/}   # defensive: strip stray CR
     [ -z "$rip" ] && continue
@@ -663,7 +664,7 @@ cmd_classify(){
       elif [ "$staticref" = "manifest" ]; then method="static-ref: manifest"
       else method="unknown"; fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$method" "$staticref" "$strTarget" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$platform" "$method" "$staticref" "$strTarget" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
   done < "$apps"
 
   echo "classify: results in $out"
@@ -676,12 +677,12 @@ cmd_report(){
   local cls="$OUT/06_classified.tsv" conns="$OUT/02_conns.tsv" cm="$OUT/03_cellmap.tsv"
   [ -s "$cls" ] || die "no $cls; run classify first"
   local out="$OUT/redis_consumers.txt"
-  echo "app_name,space,org,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
+  echo "app_name,space,org,platform,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment" > "$out"
 
   # resolved rows, deduped by (app_guid,redis_deployment)
-  awk -F'\t' 'NR>1 && $12!="" {
-      key=$12 SUBSEP $11; if (seen[key]++) next;
-      print $2","$3","$4","$5","$6","$7","$8","$9","$10","$11 }' "$cls" >> "$out"
+  awk -F'\t' 'NR>1 && $13!="" {
+      key=$13 SUBSEP $12; if (seen[key]++) next;
+      print $2","$3","$4","$5","$6","$7","$8","$9","$10","$11","$12 }' "$cls" >> "$out"
 
   # external consumers: census peer IPs not present as a cell in the cellmap.
   # Fill the redis service name/space/org from the classified rows (keyed by deployment)
@@ -690,11 +691,11 @@ cmd_report(){
     local cellips; cellips=$(awk -F'\t' 'NR>1{print $2}' "$cm" | sort -u)
     awk -F'\t' -v cells="$cellips" '
       BEGIN{ n=split(cells,a,"\n"); for(i=1;i<=n;i++) C[a[i]]=1 }
-      FNR==NR { if (FNR>1 && $11!="") { svc[$11]=$8; ssp[$11]=$9; sorg[$11]=$10 } next }  # classified: dep -> svc info
-      FNR==1 { next }                                                                    # conns header
+      FNR==NR { if (FNR>1 && $12!="") { svc[$12]=$9; ssp[$12]=$10; sorg[$12]=$11 } next }  # classified: dep -> svc info
+      FNR==1 { next }                                                                      # conns header
       $5!="" && !($5 in C) {
         key=$5 SUBSEP $2; if (seen[key]++) next;
-        print "EXTERNAL(" $5 "),,,external,,," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
+        print "EXTERNAL(" $5 "),,,,external,,," svc[$2] "," ssp[$2] "," sorg[$2] "," $2 }' "$cls" "$conns" >> "$out"
   fi
 
   echo "report: final CSV in $out"

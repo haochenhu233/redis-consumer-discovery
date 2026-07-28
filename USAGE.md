@@ -72,7 +72,10 @@ After a run, the output folder contains:
 
 ### The final report — `redis_consumers.txt`
 
-Columns: `app_name, space, org, method, static_ref, static_ref_target, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
+Columns: `app_name, space, org, platform, method, static_ref, static_ref_target, redis_service_name, redis_service_space, redis_service_org, redis_deployment`.
+
+`platform` is `windows` or `linux` (which kind of Diego cell the app runs on); blank for `external`
+rows. Windows apps are discovered the same way but need the Windows worker present (below).
 
 `space`/`org` are where the **app** runs; `redis_service_space`/`redis_service_org` are where the
 **Redis service instance** lives. When they differ, the app is reaching a Redis managed in a
