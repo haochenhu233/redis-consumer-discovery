@@ -114,6 +114,33 @@ jq -c --arg g "$guid" '.. | objects | select(has("instance_guid") and has("proce
 
 ---
 
+---
+
+## 6. End-to-end: the main tool now sweeps Windows cells
+
+Once step 5 confirms the join, the main scanner handles Windows automatically — **as long as
+`windows-wsweep.ps1` sits next to `redis-consumer-discovery.sh`** on the bastion (both come from
+`git pull`; copy both into the VDI). During `run`/`reclassify`, `sweep` detects `windows*` cells
+and runs `windows-wsweep.ps1` (WinNAT session table) instead of skipping them. Their container IPs
+then resolve to app names through the same cfdot join — so Windows consumers stop showing as
+`external`.
+
+Targeted test against the fixture's Redis (fast — one deployment):
+
+```bash
+# scan just the redis the fixture is bound to (census sees the windows cell as a peer,
+# sweep runs the ps1 worker on it, resolve maps the container IP -> the app)
+bash redis-consumer-discovery.sh run <env> ./win-test --redis <redis-deployment-of-fixture>
+
+# the fixture should now appear as a normal consumer (NOT external):
+grep -i rcd-fix-win-bind ./win-test/redis_consumers.txt
+```
+
+You should see `rcd-fix-win-bind` with a real `space,org` and `method` (cf-bind), not an
+`EXTERNAL(<cell-ip>)` row. The sweep log line will read `... 0 linux + 1 windows cell(s) swept`.
+
+---
+
 ## Teardown
 
 ```bash

@@ -333,11 +333,29 @@ _sweep_one(){
   echo "sweep: cell $cip ($cslug) -> $n container(s)"
 }
 
+# _wsweep_one: WINDOWS cell equivalent of _sweep_one. Windows containers source-NAT through
+# winc-nat, so we scp windows-wsweep.ps1 and read the WinNAT session table (Get-NetNatSession):
+# InternalSourceAddress = the container IP. Emits the SAME #RCD# rows (container_ip, NOGUID,
+# redis_ip) -> same cellmap -> resolve joins via instance_address, exactly like linux.
+_wsweep_one(){
+  local cip="$1" cslug="$2" redis_ips="$3" winworker="$4" outfile="$5"
+  g_cf scp "$winworker" "$cslug":C:/Windows/Temp/rcd-wsweep.ps1 >/dev/null 2>&1 || { echo "wsweep: scp to $cslug failed"; return 0; }
+  local raw; raw=$(g_cf ssh "$cslug" -c "powershell -ExecutionPolicy Bypass -File C:/Windows/Temp/rcd-wsweep.ps1 $redis_ips" </dev/null 2>/dev/null | tr -d '\r')
+  local n=0 ccip guid rip
+  while IFS=$'\t' read -r ccip guid rip; do
+    [ -z "$ccip" ] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$cip" "$cslug" "$ccip" "$guid" "$rip" >> "$outfile"
+    n=$((n+1))
+  done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+  echo "wsweep: windows cell $cip ($cslug) -> $n container(s)"
+}
+
 # sweep: for each cell in 02_conns.tsv, resolve its containers' connections to redis
 # into (container_ip, CF_INSTANCE_GUID) -> $OUT/03_cellmap.tsv
-# Cells are swept CONCURRENTLY (RCD_PAR at a time, default 8). Windows diego cells are
-# skipped -- they have no bash/nsenter, so sweeping them only errors. The cellmap is
-# rewritten fresh each run so it is safe to re-run (e.g. `reclassify`) without dupes.
+# Cells are swept CONCURRENTLY (RCD_PAR at a time, default 8). Linux cells use the bash
+# netns worker; WINDOWS cells use windows-wsweep.ps1 (WinNAT session table) IF that file is
+# present next to this script -- otherwise they are skipped. The cellmap is rewritten fresh
+# each run so it is safe to re-run (e.g. `reclassify`) without dupes.
 cmd_sweep(){
   local conns="$OUT/02_conns.tsv"
   [ -s "$conns" ] || die "no census file at $conns; run census first"
@@ -356,25 +374,34 @@ cmd_sweep(){
   local vms; vms=$(g_cf vms 2>/dev/null)
   local par="${RCD_PAR:-8}"
   local wdir="$OUT/.sweep"; rm -rf "$wdir"; mkdir -p "$wdir"
-  local cip cslug grp vline
-  local launched=0 skipped_win=0 skipped_noslug=0
+  local winworker; winworker="$(dirname "$SELF")/windows-wsweep.ps1"     # ps1 worker for windows cells
+  local cip cslug grp vline is_win cell_redis
+  local launched=0 wlaunched=0 skipped_win=0 skipped_noslug=0
   for cip in $cell_ips; do
     vline=$(printf '%s\n' "$vms" | grep -F "$cip" | head -1)
     cslug=$(printf '%s' "$vline" \
       | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
     [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; skipped_noslug=$((skipped_noslug+1)); continue; }
     grp="${cslug%%/*}"
-    case "$grp" in
-      *[Ww][Ii][Nn][Dd][Oo][Ww][Ss]*) echo "sweep: $cip ($cslug) is a windows cell - skipping"; skipped_win=$((skipped_win+1)); continue ;;
-    esac
+    is_win=""; case "$grp" in *[Ww][Ii][Nn][Dd][Oo][Ww][Ss]*) is_win=1 ;; esac
+    if [ -n "$is_win" ] && [ ! -f "$winworker" ]; then
+      echo "sweep: $cip ($cslug) windows cell but windows-wsweep.ps1 not found - skipping"; skipped_win=$((skipped_win+1)); continue
+    fi
     # throttle to RCD_PAR concurrent cells
     while [ "$(jobs -rp | wc -l)" -ge "$par" ]; do sleep 0.3; done
-    _sweep_one "$cip" "$cslug" "$redis_ips" "$wdir/$cip.tsv" &
-    launched=$((launched+1))
+    if [ -n "$is_win" ]; then
+      # pass only THIS cell's redis IPs (census peer_ip == cell_ip) -> short arg list for cmd.exe
+      cell_redis=$(awk -F'\t' -v c="$cip" 'NR>1 && $5==c{print $3}' "$conns" | sort -u | tr '\n' ' ')
+      _wsweep_one "$cip" "$cslug" "$cell_redis" "$winworker" "$wdir/$cip.tsv" &
+      wlaunched=$((wlaunched+1))
+    else
+      _sweep_one "$cip" "$cslug" "$redis_ips" "$wdir/$cip.tsv" &
+      launched=$((launched+1))
+    fi
   done
   wait
   cat "$wdir"/*.tsv 2>/dev/null >> "$f"
-  echo "sweep: $launched cell(s) swept (par=$par), $skipped_win windows skipped, $skipped_noslug unresolved"
+  echo "sweep: $launched linux + $wlaunched windows cell(s) swept (par=$par), $skipped_win windows skipped, $skipped_noslug unresolved"
   echo "sweep: results in $f"; column -t -s$'\t' "$f" 2>/dev/null || cat "$f"
 }
 
