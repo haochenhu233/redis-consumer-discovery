@@ -437,9 +437,13 @@ cmd_resolve(){
     die "cfdot dump empty. See --STDERR-- above; try the exact cfdot command you used manually and tell me its form (path/subcommand/flags)."
   fi
 
-  # 2) normalize LRPs -> ig<TAB>pg<TAB>instance_address<TAB>cell_id  (format-agnostic)
+  # 2) normalize LRPs. cfdot carries app identity in metric_tags (app_id/app_name/space_name/
+  # organization_name) -- platform-level, so it covers apps in orgs the cf user can't see and
+  # needs no per-app API call. Columns: ig pg instance_address cell_id app_id app_name space org
   jq -rc '.. | objects | select(has("instance_guid") and has("process_guid"))
-          | [ .instance_guid, .process_guid, (.instance_address // .address // ""), (.cell_id // "") ] | @tsv' \
+          | [ .instance_guid, .process_guid, (.instance_address // .address // ""), (.cell_id // ""),
+              (.metric_tags.app_id // ""), (.metric_tags.app_name // ""),
+              (.metric_tags.space_name // ""), (.metric_tags.organization_name // "") ] | @tsv' \
      "$OUT/04_lrps.json" > "$OUT/04_lrps.tsv" 2>/dev/null
   local lrpn; lrpn=$(wc -l < "$OUT/04_lrps.tsv" | tr -d ' ')
   echo "resolve: parsed $lrpn LRP records"
@@ -448,12 +452,14 @@ cmd_resolve(){
   # build lookups. instance_guid is globally unique; instance_address is unique on LINUX (silk
   # overlay) but REUSED per windows cell (winc-nat 172.30.x.x) -> key the IP map by (cell_id, ia)
   # so a windows container resolves to the app on ITS cell, not a collision on another cell.
-  declare -A PG_BY_IG PG_BY_IA PG_BY_CELLIP
-  local ig pg ia cid
-  while IFS=$'\t' read -r ig pg ia cid; do
+  # META_BY_PG carries the cfdot app identity (used before falling back to cf curl).
+  declare -A PG_BY_IG PG_BY_IA PG_BY_CELLIP META_BY_PG
+  local ig pg ia cid m_aid m_name m_sp m_org
+  while IFS=$'\t' read -r ig pg ia cid m_aid m_name m_sp m_org; do
     [ -n "$ig" ] && PG_BY_IG["$ig"]="$pg"
     [ -n "$ia" ] && PG_BY_IA["$ia"]="$pg"
     [ -n "$ia" ] && [ -n "$cid" ] && PG_BY_CELLIP["$cid $ia"]="$pg"
+    [ -n "$pg" ] && META_BY_PG["$pg"]="$m_aid"$'\t'"$m_name"$'\t'"$m_sp"$'\t'"$m_org"
   done < "$OUT/04_lrps.tsv"
 
   # 3) walk cellmap, resolve each container to an app (cache CF API lookups)
@@ -468,22 +474,30 @@ cmd_resolve(){
     pg="${PG_BY_IG[$guid]:-}"                     # 1) instance_guid (linux; globally unique)
     [ -z "$pg" ] && [ -n "$cid" ] && pg="${PG_BY_CELLIP["$cid $cip"]:-}"   # 2) (cell,container_ip) -- windows-safe
     [ -z "$pg" ] && pg="${PG_BY_IA[$cip]:-}"      # 3) bare container IP (linux fallback)
-    local ag name sp org
+    local ag name sp org meta mt_aid mt_name mt_sp mt_org
     if [ -n "$pg" ]; then
-      ag="${pg:0:36}"
-      if [ -n "${APP_CACHE[$ag]:-}" ]; then
-        IFS=$'\t' read -r name sp org <<< "${APP_CACHE[$ag]}"
+      # PRIMARY: app identity straight from cfdot metric_tags (no org-visibility gap, no API call)
+      meta="${META_BY_PG[$pg]:-}"; mt_aid=""; mt_name=""; mt_sp=""; mt_org=""
+      [ -n "$meta" ] && IFS=$'\t' read -r mt_aid mt_name mt_sp mt_org <<< "$meta"
+      if [ -n "$mt_name" ]; then
+        ag="${mt_aid:-${pg:0:36}}"; name="$mt_name"; sp="${mt_sp:-?}"; org="${mt_org:-?}"
       else
-        local aj sg
-        aj=$(timeout 20 cf curl "/v3/apps/$ag" 2>/dev/null)
-        name=$(printf '%s' "$aj" | jq -r '.name // "?"' 2>/dev/null)
-        sg=$(printf '%s' "$aj" | jq -r '.relationships.space.data.guid // ""' 2>/dev/null)
-        sp="?"; org="?"
-        if [ -n "$sg" ]; then
-          IFS=$'\t' read -r sp org < <(timeout 20 cf curl "/v3/spaces/$sg?include=organization" 2>/dev/null \
-            | jq -r '[ (.name // "?"), (.included.organizations[0].name // "?") ] | @tsv' 2>/dev/null)
+        # FALLBACK: metric_tags absent -> cf curl (cached), subject to the cf user's visibility
+        ag="${pg:0:36}"
+        if [ -n "${APP_CACHE[$ag]:-}" ]; then
+          IFS=$'\t' read -r name sp org <<< "${APP_CACHE[$ag]}"
+        else
+          local aj sg
+          aj=$(timeout 20 cf curl "/v3/apps/$ag" 2>/dev/null)
+          name=$(printf '%s' "$aj" | jq -r '.name // "?"' 2>/dev/null)
+          sg=$(printf '%s' "$aj" | jq -r '.relationships.space.data.guid // ""' 2>/dev/null)
+          sp="?"; org="?"
+          if [ -n "$sg" ]; then
+            IFS=$'\t' read -r sp org < <(timeout 20 cf curl "/v3/spaces/$sg?include=organization" 2>/dev/null \
+              | jq -r '[ (.name // "?"), (.included.organizations[0].name // "?") ] | @tsv' 2>/dev/null)
+          fi
+          APP_CACHE[$ag]="$name"$'\t'"$sp"$'\t'"$org"
         fi
-        APP_CACHE[$ag]="$name"$'\t'"$sp"$'\t'"$org"
       fi
     else
       ag="?"; name="UNRESOLVED"; sp="?"; org="?"
