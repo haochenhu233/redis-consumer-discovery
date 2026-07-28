@@ -606,7 +606,9 @@ cmd_classify(){
     # unresolved: we saw a live connection but never got a usable app identity this scan
     # (container churned between scan steps, or its CF record was unreadable). This is a
     # DATA gap to re-run, NOT "redis is hidden" -- keep it distinct from unknown.
-    staticref=""
+    # init BOTH unconditionally: the unresolved branch skips the static-ref block, and under
+    # `set -u` the row printf must not reference an unset strTarget.
+    staticref=""; strTarget=""
     if [ "$ag" = "?" ] || [ -z "$ag" ] || [ "$name" = "UNRESOLVED" ] || [ "$name" = "?" ]; then
       method="unresolved"
     else
