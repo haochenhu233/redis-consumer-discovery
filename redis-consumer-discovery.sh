@@ -412,17 +412,22 @@ cmd_resolve(){
   [ -s "$cm" ] || die "no cellmap at $cm; run sweep first"
   command -v jq >/dev/null || die "jq required on the bastion"
 
-  # 1) dump cfdot actual-lrps from any cell in the cellmap.
-  # Header-only cellmap = every peer was external/NAT or a skipped windows cell -> no CF
-  # apps to resolve. Emit an empty apps file and return cleanly so classify/report still
-  # run and produce an external-only report (instead of aborting the whole pass).
-  local cell; cell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
-  if [ -z "$cell" ]; then
+  # 1) dump cfdot actual-lrps. Header-only cellmap = every peer was external/NAT -> no CF apps
+  # to resolve. Emit an empty apps file and return cleanly so classify/report still run.
+  local anycell; anycell=$(awk -F'\t' 'NR>1{print $3; exit}' "$cm")
+  if [ -z "$anycell" ]; then
     printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\n' > "$OUT/05_apps.tsv"
     echo "resolve: no diego cells in cellmap (all external/NAT or windows) - no apps to resolve"
     return 0
   fi
-  echo "resolve: dumping cfdot actual-lrps from $cell ..."
+  # cfdot (and bash/sudo) only exist on LINUX cells. The cellmap can list windows cells too, so
+  # NEVER dump from a windows cell -- it produces garbage. BBS is global: any linux cell returns
+  # every LRP, incl. windows. Prefer a linux cell from the cellmap; fall back to any linux cell.
+  local cell; cell=$(awk -F'\t' 'NR>1{print $3}' "$cm" | grep -viE 'windows' | head -1)
+  [ -z "$cell" ] && cell=$(g_cf vms 2>/dev/null | grep -iE 'diego|compute' | grep -viE 'windows' \
+      | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+  [ -z "$cell" ] && die "no linux diego cell available for the cfdot dump (cfdot cannot run on windows)"
+  echo "resolve: dumping cfdot actual-lrps from $cell (linux) ..."
   g_cf scp "$SELF" "$cell":/tmp/rcd.sh >/dev/null 2>&1 || die "scp worker to $cell failed"
   echo "--- cfdot dump diagnostics (bytes + first stderr lines) ---"
   g_cf ssh "$cell" -c 'sudo bash /tmp/rcd.sh _worker-cfdot > /tmp/rcd_lrps.json 2>/tmp/rcd_lrps.err; wc -c /tmp/rcd_lrps.json; echo --STDERR--; head -3 /tmp/rcd_lrps.err'
