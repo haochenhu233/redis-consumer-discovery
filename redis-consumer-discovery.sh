@@ -437,32 +437,37 @@ cmd_resolve(){
     die "cfdot dump empty. See --STDERR-- above; try the exact cfdot command you used manually and tell me its form (path/subcommand/flags)."
   fi
 
-  # 2) normalize LRPs -> ig<TAB>pg<TAB>instance_address  (format-agnostic)
+  # 2) normalize LRPs -> ig<TAB>pg<TAB>instance_address<TAB>cell_id  (format-agnostic)
   jq -rc '.. | objects | select(has("instance_guid") and has("process_guid"))
-          | [ .instance_guid, .process_guid, (.instance_address // .address // "") ] | @tsv' \
+          | [ .instance_guid, .process_guid, (.instance_address // .address // ""), (.cell_id // "") ] | @tsv' \
      "$OUT/04_lrps.json" > "$OUT/04_lrps.tsv" 2>/dev/null
   local lrpn; lrpn=$(wc -l < "$OUT/04_lrps.tsv" | tr -d ' ')
   echo "resolve: parsed $lrpn LRP records"
   [ "$lrpn" -eq 0 ] && die "parsed 0 LRPs; inspect $OUT/04_lrps.json (unexpected cfdot format)"
 
-  # build lookups: ig->pg and ia->pg
-  declare -A PG_BY_IG PG_BY_IA
-  local ig pg ia
-  while IFS=$'\t' read -r ig pg ia; do
+  # build lookups. instance_guid is globally unique; instance_address is unique on LINUX (silk
+  # overlay) but REUSED per windows cell (winc-nat 172.30.x.x) -> key the IP map by (cell_id, ia)
+  # so a windows container resolves to the app on ITS cell, not a collision on another cell.
+  declare -A PG_BY_IG PG_BY_IA PG_BY_CELLIP
+  local ig pg ia cid
+  while IFS=$'\t' read -r ig pg ia cid; do
     [ -n "$ig" ] && PG_BY_IG["$ig"]="$pg"
     [ -n "$ia" ] && PG_BY_IA["$ia"]="$pg"
+    [ -n "$ia" ] && [ -n "$cid" ] && PG_BY_CELLIP["$cid $ia"]="$pg"
   done < "$OUT/04_lrps.tsv"
 
   # 3) walk cellmap, resolve each container to an app (cache CF API lookups)
   local out="$OUT/05_apps.tsv"
   printf 'env\tredis_ip\tcontainer_ip\tinstance_guid\tprocess_guid\tapp_guid\tapp_name\tspace\torg\n' > "$out"
   declare -A APP_CACHE
-  local e cip guid rip cinst cell_ip
+  local e cip guid rip cinst cell_ip cid
   while IFS=$'\t' read -r e cell_ip cinst cip guid rip; do
     [ "$e" = env ] && continue
     [ -z "$e" ] && continue
-    pg="${PG_BY_IG[$guid]:-}"
-    [ -z "$pg" ] && pg="${PG_BY_IA[$cip]:-}"      # fallback via container IP (NOGUID case)
+    cid="${cinst##*/}"                            # cell_id = uuid part of the instance slug
+    pg="${PG_BY_IG[$guid]:-}"                     # 1) instance_guid (linux; globally unique)
+    [ -z "$pg" ] && [ -n "$cid" ] && pg="${PG_BY_CELLIP["$cid $cip"]:-}"   # 2) (cell,container_ip) -- windows-safe
+    [ -z "$pg" ] && pg="${PG_BY_IA[$cip]:-}"      # 3) bare container IP (linux fallback)
     local ag name sp org
     if [ -n "$pg" ]; then
       ag="${pg:0:36}"
