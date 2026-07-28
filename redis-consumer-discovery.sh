@@ -341,12 +341,15 @@ _wsweep_one(){
   local cip="$1" cslug="$2" redis_ips="$3" winworker="$4" outfile="$5"
   g_cf scp "$winworker" "$cslug":C:/Windows/Temp/rcd-wsweep.ps1 >/dev/null 2>&1 || { echo "wsweep: scp to $cslug failed"; return 0; }
   local raw; raw=$(g_cf ssh "$cslug" -c "powershell -ExecutionPolicy Bypass -File C:/Windows/Temp/rcd-wsweep.ps1 $redis_ips" </dev/null 2>/dev/null | tr -d '\r')
-  local n=0 ccip guid rip
-  while IFS=$'\t' read -r ccip guid rip; do
+  local n=0 tag ccip rip
+  # IP-anchored parse: pull '#RCD# <container_ip> <redis_ip>' regardless of tab/space, bosh-ssh
+  # line decoration, or records concatenated onto one line. instance_guid is always NOGUID on
+  # windows (we join by (cell,container_ip), not CF_INSTANCE_GUID).
+  while read -r tag ccip rip; do
     [ -z "$ccip" ] && continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$cip" "$cslug" "$ccip" "$guid" "$rip" >> "$outfile"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$cip" "$cslug" "$ccip" "NOGUID" "$rip" >> "$outfile"
     n=$((n+1))
-  done < <(printf '%s\n' "$raw" | grep -oE '#RCD#.*' | cut -f2-)
+  done < <(printf '%s\n' "$raw" | grep -oE '#RCD#[[:space:]]+[0-9.]+[[:space:]]+[0-9.]+')
   echo "wsweep: windows cell $cip ($cslug) -> $n container(s)"
 }
 

@@ -8,6 +8,8 @@
 param([Parameter(ValueFromRemainingArguments=$true)][string[]]$RedisIps)
 $ErrorActionPreference = 'SilentlyContinue'
 
+# SPACE-separated, IP-only payload: '#RCD# <container_ip> <redis_ip>'. No tabs -- the windows
+# bosh-ssh PTY mangles tabs; the bastion parses this with an IP-anchored regex so fields can't drift.
 $seen = @{}
 Get-NetNatSession | ForEach-Object {
   $dst = $_.InternalDestinationAddress
@@ -15,10 +17,10 @@ Get-NetNatSession | ForEach-Object {
   if ($RedisIps -contains $dst) {
     $cip = $_.InternalSourceAddress
     if ($cip) {
-      $key = "$cip`t$dst"                       # one row per (container, redis); apps pool sockets
+      $key = "$cip $dst"                         # one row per (container, redis); apps pool sockets
       if (-not $seen.ContainsKey($key)) {
         $seen[$key] = $true
-        Write-Output ("#RCD#`t" + $cip + "`tNOGUID`t" + $dst)
+        Write-Output ("#RCD# " + $cip + " " + $dst)
       }
     }
   }
