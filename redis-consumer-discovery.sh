@@ -329,17 +329,22 @@ cmd_scan_apps(){
   [ -z "$plan_guids" ] && die "no service plans for offering '$roff'"
   echo "scan-apps: offering '$roff' -> $(printf '%s' "$plan_guids" | tr ',' '\n' | grep -c .) plan(s)"
 
-  # redis service instances: si_guid -> si_name \t si_space \t si_org (space/org via SPACE_INFO)
+  # redis service instances: si_guid -> si_name \t si_space \t si_org (space/org via SPACE_INFO).
+  # Also dump every SI + its last_operation to fwd_redis_si.tsv -- a SI here with no matching BOSH
+  # deployment (or a non-succeeded state) is an orphaned/dead service (merge flags it).
   declare -A REDIS_SI
-  local sig sin sisg sispace siorg n_si=0
-  while IFS=$'\t' read -r sig sin sisg; do
+  local siout="$OUT/fwd_redis_si.tsv"
+  printf 'service_instance_guid\tredis_service_name\tredis_service_space\tredis_service_org\tlast_op_type\tlast_op_state\n' > "$siout"
+  local sig sin sisg sispace siorg siopt siops n_si=0
+  while IFS=$'\t' read -r sig sin sisg siopt siops; do
     [ -z "$sig" ] && continue
     info="${SPACE_INFO[$sisg]:-}"
     if [ -n "$info" ]; then IFS=$'\t' read -r sispace siorg <<< "$info"; else sispace="?"; siorg="?"; fi
     REDIS_SI["$sig"]="$sin"$'\t'"$sispace"$'\t'"$siorg"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sig" "$sin" "$sispace" "$siorg" "$siopt" "$siops" >> "$siout"
     n_si=$((n_si+1))
-  done < <(cf_paginate "/v3/service_instances?service_plan_guids=$plan_guids&per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid] | @tsv')
-  echo "scan-apps: $n_si redis service instance(s)"
+  done < <(cf_paginate "/v3/service_instances?service_plan_guids=$plan_guids&per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid, (.last_operation.type//""), (.last_operation.state//"")] | @tsv')
+  echo "scan-apps: $n_si redis service instance(s) -> $siout"
 
   # cf-bind pairs: list ALL app bindings once, keep those whose SI is a redis SI -> fwd_binds.tsv
   local bout="$OUT/fwd_binds.tsv"
