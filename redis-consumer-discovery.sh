@@ -29,7 +29,7 @@ set -uo pipefail
 # worker (scp'd to a host, no <env>):  _worker-census | _worker-sweep
 SUB="${1:-}"; shift || true
 [ -z "$SUB" ] && { echo "usage: $(basename "$0") <subcommand> <env> [output-dir] [--redis <dep>] [--cell <group/idx>]"; exit 1; }
-ENV=""; OUT="."; REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"; SELF=""
+ENV=""; OUT="."; REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"; SELF=""; BACKWARD_DIR=""
 case "$SUB" in
   _worker-*) : ;;                                   # workers run on-host; no <env>/flags
   *)
@@ -39,8 +39,9 @@ case "$SUB" in
     if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then OUT="$1"; shift; fi
     while [ "${1:-}" ]; do
       case "$1" in
-        --redis) REDIS_DEP="${2:-}"; shift 2 ;;
-        --cell)  CELL_INSTANCE="${2:-}"; shift 2 ;;
+        --redis)    REDIS_DEP="${2:-}"; shift 2 ;;
+        --cell)     CELL_INSTANCE="${2:-}"; shift 2 ;;
+        --backward) BACKWARD_DIR="${2:-}"; shift 2 ;;
         *) echo "ERROR: unknown arg '$1'"; exit 1 ;;
       esac
     done
@@ -465,6 +466,93 @@ cmd_ghosts(){
 
   echo "ghosts: $g ghost SI(s) [CF, no BOSH deployment], $o orphaned deployment(s) [BOSH, no CF SI] -> $out"
   column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
+}
+
+# merge: join the FORWARD scan (scan-apps: app_base/fwd_binds/fwd_static/fwd_redis_si + list-redis's
+# redis_deployments) with a BACKWARD scan (06_classified.tsv) on (app_guid, service_instance_guid).
+# Emits merged_report.csv where every app<->redis relationship carries:
+#   method, static_ref/target, platform, deployment_exists (ghost), live_connection, source.
+#   merge <env> <forward-dir> --backward <backward-scan-dir>
+cmd_merge(){
+  local fwd="$OUT" bwd="$BACKWARD_DIR"
+  [ -n "$bwd" ] || die "merge needs --backward <backward-scan-dir> (the dir holding 06_classified.tsv)"
+  local appf="$fwd/app_base.tsv" bindf="$fwd/fwd_binds.tsv" statf="$fwd/fwd_static.tsv"
+  local sif="$fwd/fwd_redis_si.tsv" depf="$fwd/redis_deployments.tsv"
+  local clsf="$bwd/06_classified.tsv" ipsf="$bwd/redis_ips.tsv"
+  [ -s "$appf" ] || die "no $appf -- run: scan-apps <env> $fwd"
+  [ -s "$clsf" ] || die "no $clsf -- run the backward scan (run/reclassify) into $bwd"
+
+  local SEP=' ' UNK3=$'?\t?\t?'
+  declare -A APP_INFO SI_INFO DEP_OF_SI IP_TO_SI STAT_REF STAT_TGT
+  declare -A P_BIND P_LIVE P_PLAT P_METHB ALLKEYS APP_HAS_PAIR
+  local a b c d e key app si dep s2
+
+  # reference maps
+  while IFS=$'\t' read -r a b c d e; do [ "$a" = env ] && continue; [ -n "$b" ] && APP_INFO["$b"]="$c"$'\t'"$d"$'\t'"$e"; done < "$appf"
+  [ -s "$sif" ]  && while IFS=$'\t' read -r a b c d e; do [ "$a" = service_instance_guid ] && continue; [ -n "$a" ] && SI_INFO["$a"]="$b"$'\t'"$c"$'\t'"$d"; done < "$sif"
+  [ -s "$depf" ] && while IFS=$'\t' read -r a b;       do [ "$a" = redis_deployment ] && continue; [ -n "$b" ] && DEP_OF_SI["$b"]="$a"; done < "$depf"
+  [ -s "$ipsf" ] && while IFS=$'\t' read -r a b;       do [ -z "$b" ] && continue; s2=""; [ "${#a}" -ge 36 ] && s2="${a: -36}"; [ -n "$s2" ] && IP_TO_SI["$b"]="$s2"; done < "$ipsf"
+  [ -s "$statf" ] && while IFS=$'\t' read -r a b c;    do [ "$a" = app_guid ] && continue; [ -n "$a" ] && { STAT_REF["$a"]="$b"; STAT_TGT["$a"]="$c"; }; done < "$statf"
+
+  # pairs from forward binds (declared cf-bind)
+  [ -s "$bindf" ] && while IFS=$'\t' read -r app si c; do
+    [ "$app" = app_guid ] && continue
+    [ -n "$app" ] && [ -n "$si" ] && { key="$app$SEP$si"; P_BIND["$key"]=1; ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1; }
+  done < "$bindf"
+
+  # pairs from backward 06_classified (live connection). cols: 5=platform 6=method 12=redis_deployment 13=app_guid
+  local c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14
+  while IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14; do
+    [ "$c1" = env ] && continue
+    app="$c13"; dep="$c12"
+    { [ -z "$app" ] || [ "$app" = "?" ]; } && continue
+    si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"
+    [ -z "$si" ] && continue
+    key="$app$SEP$si"; P_LIVE["$key"]=1; P_PLAT["$key"]="$c5"; P_METHB["$key"]="$c6"
+    ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1
+  done < "$clsf"
+
+  local out="$fwd/merged_report.csv"
+  echo "app_name,space,org,app_guid,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment,service_instance_guid,platform,deployment_exists,live_connection,source" > "$out"
+
+  local aname aspace aorg sname sspace sorg depx live bound plat sref stgt method src
+  for key in "${!ALLKEYS[@]}"; do
+    app="${key% *}"; si="${key#* }"
+    IFS=$'\t' read -r aname aspace aorg <<< "${APP_INFO[$app]:-$UNK3}"
+    IFS=$'\t' read -r sname sspace sorg <<< "${SI_INFO[$si]:-$UNK3}"
+    dep="${DEP_OF_SI[$si]:-}"; depx="no"; [ -n "$dep" ] && depx="yes" || dep="(none)"
+    live="no"; [ -n "${P_LIVE[$key]:-}" ] && live="yes"
+    bound="no"; [ -n "${P_BIND[$key]:-}" ] && bound="yes"
+    plat="${P_PLAT[$key]:-}"
+    sref="${STAT_REF[$app]:-}"; stgt="${STAT_TGT[$app]:-}"
+    if [ "$bound" = yes ]; then method="cf-bind"
+    elif [ -n "$sref" ]; then method="static-ref: $sref"
+    elif [ -n "${P_METHB[$key]:-}" ]; then method="${P_METHB[$key]}"
+    else method="unknown"; fi
+    if [ "$bound" = yes ] && [ "$live" = yes ]; then src="both"
+    elif [ "$bound" = yes ]; then src="forward"
+    else src="backward"; fi
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$aname" "$aspace" "$aorg" "$app" "$method" "$sref" "$stgt" "$sname" "$sspace" "$sorg" "$dep" "$si" "$plat" "$depx" "$live" "$src" >> "$out"
+  done
+
+  # pure static-ref apps: declared static, never bound, never connected (bound-but-idle's cousin)
+  local pstat=0
+  for app in "${!STAT_REF[@]}"; do
+    [ -n "${APP_HAS_PAIR[$app]:-}" ] && continue
+    IFS=$'\t' read -r aname aspace aorg <<< "${APP_INFO[$app]:-$UNK3}"
+    stgt="${STAT_TGT[$app]}"; local h="${stgt%%;*}"; si="?"
+    [ -n "${IP_TO_SI[$h]:-}" ] && si="${IP_TO_SI[$h]}"
+    IFS=$'\t' read -r sname sspace sorg <<< "${SI_INFO[$si]:-$UNK3}"
+    dep="${DEP_OF_SI[$si]:-}"; depx="no"; [ -n "$dep" ] && depx="yes" || dep="(none)"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,,%s,%s,%s\n' \
+      "$aname" "$aspace" "$aorg" "$app" "static-ref: ${STAT_REF[$app]}" "${STAT_REF[$app]}" "$stgt" "$sname" "$sspace" "$sorg" "$dep" "$si" "$depx" "no" "forward" >> "$out"
+    pstat=$((pstat+1))
+  done
+
+  local nrows; nrows=$(($(wc -l < "$out") - 1))
+  echo "merge: $nrows app<->redis row(s) -> $out"
+  echo "merge: (${#ALLKEYS[@]} bound/connected pair(s) + $pstat declared-static-only app(s))"
 }
 
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
@@ -1004,6 +1092,7 @@ case "$SUB" in
   scan-apps)       cmd_scan_apps ;;
   list-redis)      cmd_list_redis ;;
   ghosts)          cmd_ghosts ;;
+  merge)           cmd_merge ;;
   merge-orphaned)  cmd_merge_orphaned ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
