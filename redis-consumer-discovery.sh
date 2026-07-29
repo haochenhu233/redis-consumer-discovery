@@ -359,6 +359,27 @@ cmd_scan_apps(){
   echo "scan-apps: $nb cf-bind app<->redis binding(s) -> $bout"
 }
 
+# list-redis: authoritative BOSH redis deployment list -> $OUT/redis_deployments.tsv
+# (redis_deployment, service_instance_guid). This is the ONLY source of truth for "the redis
+# actually exists" -- CF's last_operation can say 'succeeded' while the BOSH deployment is gone
+# (a ghost SI). The merge compares the forward CF SIs against this: a CF SI whose guid is not here
+# = ghost redis. One genesis call; fast.
+cmd_list_redis(){
+  local pat='redis'; [ -n "${RCD_INCLUDE_VALKEY:-}" ] && pat='redis|valkey'
+  local out="$OUT/redis_deployments.tsv"
+  printf 'redis_deployment\tservice_instance_guid\n' > "$out"
+  local d si n=0
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    si=""; [ "${#d}" -ge 36 ] && si="${d: -36}"        # last 36 chars = CF service-instance GUID
+    printf '%s\t%s\n' "$d" "$si" >> "$out"
+    n=$((n+1))
+  done < <(g_dir deployments 2>/dev/null \
+    | grep -oE '[a-z][a-z0-9_-]*-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+    | grep -iE "$pat" | sort -u)
+  echo "list-redis: $n redis deployment(s) -> $out"
+}
+
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
 # no shared-file append, so many run concurrently). Emits rows WITHOUT a header:
 #   env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port
@@ -894,6 +915,7 @@ case "$SUB" in
   run)             cmd_run ;;
   reclassify)      cmd_reclassify ;;
   scan-apps)       cmd_scan_apps ;;
+  list-redis)      cmd_list_redis ;;
   merge-orphaned)  cmd_merge_orphaned ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
