@@ -320,6 +320,38 @@ cmd_scan_apps(){
   local total; total=$(timeout 30 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq -r '.pagination.total_results // "?"' 2>/dev/null)
   echo "scan-apps: enumerated $n app(s) -> $out"
   echo "scan-apps: CF API reports total_results=$total  (should match $n)"
+
+  # STEP 2: cf-bind detection. redis offering -> plans -> service instances -> app bindings.
+  local roff="${RCD_REDIS_OFFERING:-redis}"
+  local off_guids; off_guids=$(cf_paginate "/v3/service_offerings?names=$roff&per_page=200" | jq -r '.guid' | paste -sd, -)
+  [ -z "$off_guids" ] && die "no service offering named '$roff' (set RCD_REDIS_OFFERING=... if it differs)"
+  local plan_guids; plan_guids=$(cf_paginate "/v3/service_plans?service_offering_guids=$off_guids&per_page=200" | jq -r '.guid' | paste -sd, -)
+  [ -z "$plan_guids" ] && die "no service plans for offering '$roff'"
+  echo "scan-apps: offering '$roff' -> $(printf '%s' "$plan_guids" | tr ',' '\n' | grep -c .) plan(s)"
+
+  # redis service instances: si_guid -> si_name \t si_space \t si_org (space/org via SPACE_INFO)
+  declare -A REDIS_SI
+  local sig sin sisg sispace siorg n_si=0
+  while IFS=$'\t' read -r sig sin sisg; do
+    [ -z "$sig" ] && continue
+    info="${SPACE_INFO[$sisg]:-}"
+    if [ -n "$info" ]; then IFS=$'\t' read -r sispace siorg <<< "$info"; else sispace="?"; siorg="?"; fi
+    REDIS_SI["$sig"]="$sin"$'\t'"$sispace"$'\t'"$siorg"
+    n_si=$((n_si+1))
+  done < <(cf_paginate "/v3/service_instances?service_plan_guids=$plan_guids&per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid] | @tsv')
+  echo "scan-apps: $n_si redis service instance(s)"
+
+  # cf-bind pairs: list ALL app bindings once, keep those whose SI is a redis SI -> fwd_binds.tsv
+  local bout="$OUT/fwd_binds.tsv"
+  printf 'app_guid\tservice_instance_guid\tredis_service_name\tredis_service_space\tredis_service_org\n' > "$bout"
+  local bapp bsi nb=0
+  while IFS=$'\t' read -r bapp bsi; do
+    [ -z "$bapp" ] && continue
+    [ -z "${REDIS_SI[$bsi]:-}" ] && continue          # binding is not to a redis SI -> skip
+    printf '%s\t%s\t%s\n' "$bapp" "$bsi" "${REDIS_SI[$bsi]}" >> "$bout"
+    nb=$((nb+1))
+  done < <(cf_paginate "/v3/service_credential_bindings?type=app&per_page=200" | jq -r '[.relationships.app.data.guid, .relationships.service_instance.data.guid] | @tsv')
+  echo "scan-apps: $nb cf-bind app<->redis binding(s) -> $bout"
 }
 
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
