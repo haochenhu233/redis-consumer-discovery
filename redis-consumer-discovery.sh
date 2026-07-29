@@ -276,6 +276,24 @@ cmd_reclassify(){
   echo; echo "== done :: $OUT/redis_consumers.txt =="
 }
 
+# _scan_app_static <app_guid> <outfile>: STEP-3 per-app worker (parallel-safe). Fetch the app's
+# env vars + reconstructed manifest and flag a static redis/valkey reference. Unlike the backward
+# classify (which anchors on a specific redis IP), the forward scan asks "does this app hardcode
+# ANY redis?" -> generic pattern. Writes a row ONLY if a static ref is found:
+#   app_guid \t static_ref(env-var|manifest) \t static_ref_target(host(s), ; -joined)
+_scan_app_static(){
+  local ag="$1" out="$2"
+  local gpat='(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)'
+  local env man sr="" tgt=""
+  env=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
+  man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
+  if printf '%s' "$env" | grep -qiE "$gpat" 2>/dev/null; then sr="env-var"
+  elif printf '%s' "$man" | grep -qiE "$gpat" 2>/dev/null; then sr="manifest"; fi
+  [ -z "$sr" ] && return 0                              # no static redis ref -> nothing to record
+  tgt=$( { _extract_redis_hosts "$env"; _extract_redis_hosts "$man"; } | awk 'NF' | sort -u | paste -sd';' - )
+  printf '%s\t%s\t%s\n' "$ag" "$sr" "$tgt" >> "$out"
+}
+
 # ---------------------------------------------------------------- forward scan ---
 # scan-apps: FORWARD scan. Enumerate ALL apps via the CF API and record which DECLARE redis usage
 # (cf-bind / static-ref) -- regardless of whether they hold a live connection. Complements the
@@ -283,8 +301,9 @@ cmd_reclassify(){
 # CF-API ONLY (no genesis/bosh) -- uses the CURRENT `cf` login, which must be able to read env vars
 # (full cloud_controller.admin or Space Developer). <env> is only a label here.
 #
-# STEP 1 (this build): app enumeration -> $OUT/app_base.tsv (env, app_guid, app_name, space, org).
-# Bulk list endpoints only (orgs/spaces/apps), so it's a few dozen calls, not per-app.
+# Outputs: app_base.tsv (apps), fwd_redis_si.tsv (redis SIs), fwd_binds.tsv (cf-bind pairs),
+# fwd_static.tsv (apps with a static redis ref). Steps 1-2 are bulk list calls; step 3 is one
+# env + one manifest curl per app (parallel, RCD_PAR) -- the slow phase at 5-6k apps.
 cmd_scan_apps(){
   command -v jq >/dev/null || die "jq required on the bastion"
   timeout 30 cf curl "/v3/apps?per_page=1" >/dev/null 2>&1 || die "cf not logged in / not targeted (scan-apps uses the current cf session)"
@@ -357,6 +376,26 @@ cmd_scan_apps(){
     nb=$((nb+1))
   done < <(cf_paginate "/v3/service_credential_bindings?type=app&per_page=200" | jq -r '[.relationships.app.data.guid, .relationships.service_instance.data.guid] | @tsv')
   echo "scan-apps: $nb cf-bind app<->redis binding(s) -> $bout"
+
+  # STEP 3: per-app static-ref (env vars / manifest). One env + one manifest curl per app, run as a
+  # bounded pool (RCD_PAR). NEEDS a cf role that can read env vars (full admin / Space Developer);
+  # a read-only/auditor role silently yields no static refs. At 5-6k apps this is the slow phase.
+  timeout 20 cf oauth-token >/dev/null 2>&1 || true      # refresh token once before fanning out
+  local par="${RCD_PAR:-8}" sdir="$OUT/.static"; rm -rf "$sdir"; mkdir -p "$sdir"
+  local _e sag _rest i=0
+  while IFS=$'\t' read -r _e sag _rest; do
+    [ "$_e" = env ] && continue
+    [ -z "$sag" ] && continue
+    i=$((i+1))
+    while [ "$(jobs -rp | wc -l)" -ge "$par" ]; do sleep 0.2; done
+    _scan_app_static "$sag" "$sdir/$sag.tsv" &
+  done < "$out"
+  wait
+  local sout="$OUT/fwd_static.tsv"
+  printf 'app_guid\tstatic_ref\tstatic_ref_target\n' > "$sout"
+  cat "$sdir"/*.tsv 2>/dev/null >> "$sout"
+  local nstat; nstat=$(($(wc -l < "$sout") - 1))
+  echo "scan-apps: checked $i app(s) for static refs (par=$par), $nstat with a static redis ref -> $sout"
 }
 
 # list-redis: authoritative BOSH redis deployment list -> $OUT/redis_deployments.tsv
