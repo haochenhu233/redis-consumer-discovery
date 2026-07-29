@@ -77,6 +77,20 @@ dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
 cell_slug_for_ip(){ g_cf vms 2>/dev/null | grep -F "$1" \
   | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
 
+# cf_paginate <v3-path>: emit .resources[] (compact JSON, one per line) across ALL pages of a v3
+# list endpoint, following pagination.next. Used by the forward scan (scan-apps). Uses the current
+# `cf` session -- no genesis/bosh.
+cf_paginate(){
+  local next="$1"
+  while [ -n "$next" ] && [ "$next" != "null" ]; do
+    local page; page=$(timeout 60 cf curl "$next" 2>/dev/null)
+    [ -z "$page" ] && break
+    printf '%s' "$page" | jq -c '.resources[]?' 2>/dev/null
+    next=$(printf '%s' "$page" | jq -r '.pagination.next.href // "null"' 2>/dev/null)
+    [ "$next" != "null" ] && [ -n "$next" ] && next="/v3/${next#*/v3/}"   # strip host -> path for cf curl
+  done
+}
+
 # ---------------------------------------------------------------- preflight ---
 # NOTE: remote commands run via `... ssh <inst> -c '<cmd>'` MUST avoid double-quotes
 # and parentheses -- they do not survive the genesis->bosh->ssh layering (the remote
@@ -260,6 +274,52 @@ cmd_reclassify(){
   cmd_classify || die "classify failed"
   cmd_report
   echo; echo "== done :: $OUT/redis_consumers.txt =="
+}
+
+# ---------------------------------------------------------------- forward scan ---
+# scan-apps: FORWARD scan. Enumerate ALL apps via the CF API and record which DECLARE redis usage
+# (cf-bind / static-ref) -- regardless of whether they hold a live connection. Complements the
+# backward (redis->connection) scan: `merge` then joins the two and adds a live_connection column.
+# CF-API ONLY (no genesis/bosh) -- uses the CURRENT `cf` login, which must be able to read env vars
+# (full cloud_controller.admin or Space Developer). <env> is only a label here.
+#
+# STEP 1 (this build): app enumeration -> $OUT/app_base.tsv (env, app_guid, app_name, space, org).
+# Bulk list endpoints only (orgs/spaces/apps), so it's a few dozen calls, not per-app.
+cmd_scan_apps(){
+  command -v jq >/dev/null || die "jq required on the bastion"
+  timeout 30 cf curl "/v3/apps?per_page=1" >/dev/null 2>&1 || die "cf not logged in / not targeted (scan-apps uses the current cf session)"
+  echo "scan-apps :: forward scan (CF API, current cf target)"
+
+  # orgs: guid -> name
+  declare -A ORG_NAME
+  local og on
+  while IFS=$'\t' read -r og on; do [ -n "$og" ] && ORG_NAME["$og"]="$on"; done < <(
+    cf_paginate "/v3/organizations?per_page=200" | jq -r '[.guid, .name] | @tsv')
+  echo "scan-apps: ${#ORG_NAME[@]} org(s)"
+
+  # spaces: guid -> space_name \t org_name
+  declare -A SPACE_INFO
+  local sg sn sog
+  while IFS=$'\t' read -r sg sn sog; do
+    [ -n "$sg" ] && SPACE_INFO["$sg"]="$sn"$'\t'"${ORG_NAME[$sog]:-?}"
+  done < <(cf_paginate "/v3/spaces?per_page=200" | jq -r '[.guid, .name, .relationships.organization.data.guid] | @tsv')
+  echo "scan-apps: ${#SPACE_INFO[@]} space(s)"
+
+  # apps: guid, name, space -> app_base.tsv
+  local out="$OUT/app_base.tsv"
+  printf 'env\tapp_guid\tapp_name\tspace\torg\n' > "$out"
+  local ag an asg info spn orgn n=0
+  while IFS=$'\t' read -r ag an asg; do
+    [ -z "$ag" ] && continue
+    info="${SPACE_INFO[$asg]:-}"
+    if [ -n "$info" ]; then IFS=$'\t' read -r spn orgn <<< "$info"; else spn="?"; orgn="?"; fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ENV" "$ag" "$an" "$spn" "$orgn" >> "$out"
+    n=$((n+1))
+  done < <(cf_paginate "/v3/apps?per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid] | @tsv')
+
+  local total; total=$(timeout 30 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq -r '.pagination.total_results // "?"' 2>/dev/null)
+  echo "scan-apps: enumerated $n app(s) -> $out"
+  echo "scan-apps: CF API reports total_results=$total  (should match $n)"
 }
 
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
@@ -796,6 +856,7 @@ case "$SUB" in
   preflight)       cmd_preflight ;;
   run)             cmd_run ;;
   reclassify)      cmd_reclassify ;;
+  scan-apps)       cmd_scan_apps ;;
   merge-orphaned)  cmd_merge_orphaned ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
