@@ -380,6 +380,54 @@ cmd_list_redis(){
   echo "list-redis: $n redis deployment(s) -> $out"
 }
 
+# ghosts: cross-reference CF redis service instances (scan-apps) against BOSH deployments
+# (list-redis). Catches what neither side sees alone:
+#   GHOST-SI          : a CF service instance with NO BOSH deployment (CF says 'succeeded' but the
+#                       redis is gone). If it has bound apps, those are dangling bindings.
+#   ORPHAN-DEPLOYMENT : a BOSH redis deployment with NO CF service instance.
+# Needs $OUT/fwd_redis_si.tsv (scan-apps) and $OUT/redis_deployments.tsv (list-redis).
+cmd_ghosts(){
+  local sif="$OUT/fwd_redis_si.tsv" depf="$OUT/redis_deployments.tsv" bindf="$OUT/fwd_binds.tsv"
+  [ -s "$sif" ]  || die "no $sif -- run: scan-apps <env> $OUT   first"
+  [ -s "$depf" ] || die "no $depf -- run: list-redis <env> $OUT   first"
+  local out="$OUT/ghost_redis.tsv"
+  printf 'kind\tservice_instance_guid\tredis_service_name\tspace\torg\tlast_op_state\tbound_app_count\n' > "$out"
+
+  declare -A DEP_SI CF_SI BIND_CT
+  local dname dsi sig sin ssp sorg _t sst bapp bsi
+  while IFS=$'\t' read -r dname dsi; do [ "$dname" = redis_deployment ] && continue; [ -n "$dsi" ] && DEP_SI["$dsi"]=1; done < "$depf"
+  while IFS=$'\t' read -r sig _t; do [ "$sig" = service_instance_guid ] && continue; [ -n "$sig" ] && CF_SI["$sig"]=1; done < "$sif"
+  if [ -s "$bindf" ]; then
+    while IFS=$'\t' read -r bapp bsi _t; do
+      [ "$bapp" = app_guid ] && continue
+      [ -n "$bsi" ] && BIND_CT["$bsi"]=$(( ${BIND_CT["$bsi"]:-0} + 1 ))
+    done < "$bindf"
+  fi
+
+  # GHOST-SI: CF service instance with no BOSH deployment
+  local g=0
+  while IFS=$'\t' read -r sig sin ssp sorg _t sst; do
+    [ "$sig" = service_instance_guid ] && continue
+    [ -z "$sig" ] && continue
+    [ -n "${DEP_SI[$sig]:-}" ] && continue                    # has a deployment -> healthy
+    printf 'GHOST-SI\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sig" "$sin" "$ssp" "$sorg" "$sst" "${BIND_CT[$sig]:-0}" >> "$out"
+    g=$((g+1))
+  done < "$sif"
+
+  # ORPHAN-DEPLOYMENT: BOSH redis deployment with no CF service instance
+  local o=0
+  while IFS=$'\t' read -r dname dsi; do
+    [ "$dname" = redis_deployment ] && continue
+    [ -z "$dsi" ] && continue
+    [ -n "${CF_SI[$dsi]:-}" ] && continue
+    printf 'ORPHAN-DEPLOYMENT\t%s\t%s\t\t\t\t\n' "$dsi" "$dname" >> "$out"
+    o=$((o+1))
+  done < "$depf"
+
+  echo "ghosts: $g ghost SI(s) [CF, no BOSH deployment], $o orphaned deployment(s) [BOSH, no CF SI] -> $out"
+  column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
+}
+
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
 # no shared-file append, so many run concurrently). Emits rows WITHOUT a header:
 #   env\tredis_dep\tredis_ip\tredis_port\tpeer_ip\tpeer_port
@@ -916,6 +964,7 @@ case "$SUB" in
   reclassify)      cmd_reclassify ;;
   scan-apps)       cmd_scan_apps ;;
   list-redis)      cmd_list_redis ;;
+  ghosts)          cmd_ghosts ;;
   merge-orphaned)  cmd_merge_orphaned ;;
   inventory)       cmd_inventory ;;
   census)          cmd_census ;;
