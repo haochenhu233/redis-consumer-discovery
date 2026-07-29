@@ -41,14 +41,16 @@ This scans **every Redis deployment** on the foundation, identifies the apps con
 classifies how each app uses Redis, and writes the results (see section 4). It skips idle or
 orphaned Redis automatically and never stops on a single failure.
 
-By default results go to the **current directory**. To choose an output folder:
+Results are written under a **base directory**, in a `backward/` subfolder. By default the base is
+the **current directory** (so results land in `./backward/`). To choose a base:
 
-    bash redis-consumer-discovery.sh run <env> ./scan-output
+    bash redis-consumer-discovery.sh run <env> --path ./np-scan     # -> ./np-scan/backward/
 
 Options (prepend or append as needed):
 
 | Option | Effect |
 |---|---|
+| `--path <dir>` | Base directory for output; created if needed. Results go to `<dir>/backward/` (default: `./backward/`). |
 | `RCD_PAR=<n> bash ... run <env>` | How many Redis/cells to scan **concurrently** (default 8). Raise for speed, lower if the director is strained. |
 | `RCD_RESUME=1 bash ... run <env>` | Continue an interrupted scan; skip Redis already done. |
 | `RCD_INCLUDE_VALKEY=1 bash ... run <env>` | Also scan Valkey (default: Redis only). |
@@ -62,7 +64,7 @@ Options (prepend or append as needed):
 
 ## 4. Generated files
 
-After a run, the output folder contains:
+After a run, the `backward/` folder (under your base dir, or `./backward/` by default) contains:
 
 | File | What it is | Use this for |
 |---|---|---|

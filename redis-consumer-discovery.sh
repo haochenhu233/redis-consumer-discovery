@@ -28,23 +28,34 @@ set -uo pipefail
 # orchestrator (on bastion):  <subcommand> <env> [output-dir] [--redis d] [--cell i]
 # worker (scp'd to a host, no <env>):  _worker-census | _worker-sweep
 SUB="${1:-}"; shift || true
-[ -z "$SUB" ] && { echo "usage: $(basename "$0") <subcommand> <env> [output-dir] [--redis <dep>] [--cell <group/idx>]"; exit 1; }
-ENV=""; OUT="."; REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"; SELF=""; BACKWARD_DIR=""
+[ -z "$SUB" ] && { echo "usage: $(basename "$0") <subcommand> <env> [--path <dir>] [--redis <dep>] [--cell <group/idx>]"; exit 1; }
+ENV=""; OUT="."; REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"; SELF=""; PATH_BASE=""
+# Directory layout under the BASE path (--path, or a positional dir, else the current dir):
+#   <base>/backward/   -- run / reclassify / census / sweep / resolve / classify / report / ...
+#   <base>/forward/    -- scan-apps / list-redis / ghosts
+#   <base>/merged_report.csv  -- merge (works at the base level; reads backward/ + forward/)
 case "$SUB" in
   _worker-*) : ;;                                   # workers run on-host; no <env>/flags
   *)
     ENV="${1:-}"; shift || true
     [ -z "$ENV" ] && { echo "ERROR: <env> is required"; exit 1; }
     ENV="${ENV#@}"; ENV="${ENV%.yml}"               # normalize: strip leading @ and trailing .yml
-    if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then OUT="$1"; shift; fi
+    if [ "${1:-}" ] && [ "${1:0:1}" != "-" ]; then PATH_BASE="$1"; shift; fi   # optional positional base
     while [ "${1:-}" ]; do
       case "$1" in
-        --redis)    REDIS_DEP="${2:-}"; shift 2 ;;
-        --cell)     CELL_INSTANCE="${2:-}"; shift 2 ;;
-        --backward) BACKWARD_DIR="${2:-}"; shift 2 ;;
+        --path)  PATH_BASE="${2:-}"; shift 2 ;;
+        --redis) REDIS_DEP="${2:-}"; shift 2 ;;
+        --cell)  CELL_INSTANCE="${2:-}"; shift 2 ;;
         *) echo "ERROR: unknown arg '$1'"; exit 1 ;;
       esac
     done
+    PATH_BASE="${PATH_BASE:-.}"
+    mkdir -p "$PATH_BASE" 2>/dev/null || { echo "ERROR: cannot create path '$PATH_BASE'"; exit 1; }
+    case "$SUB" in
+      scan-apps|list-redis|ghosts) OUT="$PATH_BASE/forward" ;;    # forward scan artifacts
+      merge)                       OUT="$PATH_BASE" ;;            # base: reads backward/ + forward/
+      *)                           OUT="$PATH_BASE/backward" ;;   # backward scan artifacts
+    esac
     mkdir -p "$OUT"
     SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
     ;;
@@ -468,19 +479,26 @@ cmd_ghosts(){
   column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
 }
 
-# merge: join the FORWARD scan (scan-apps: app_base/fwd_binds/fwd_static/fwd_redis_si + list-redis's
-# redis_deployments) with a BACKWARD scan (06_classified.tsv) on (app_guid, service_instance_guid).
-# Emits merged_report.csv where every app<->redis relationship carries:
-#   method, static_ref/target, platform, deployment_exists (ghost), live_connection, source.
-#   merge <env> <forward-dir> --backward <backward-scan-dir>
+# merge: join the FORWARD scan (<base>/forward: app_base/fwd_binds/fwd_static/fwd_redis_si +
+# list-redis's redis_deployments) with the BACKWARD scan (<base>/backward/06_classified.tsv) on
+# (app_guid, service_instance_guid). Writes <base>/merged_report.csv where every app<->redis
+# relationship carries: method, static_ref/target, platform, deployment_exists (ghost),
+# live_connection, source.   merge <env> [--path <base>]   (base defaults to the current dir)
 cmd_merge(){
-  local fwd="$OUT" bwd="$BACKWARD_DIR"
-  [ -n "$bwd" ] || die "merge needs --backward <backward-scan-dir> (the dir holding 06_classified.tsv)"
+  local base="$OUT" fwd="$OUT/forward" bwd="$OUT/backward"
   local appf="$fwd/app_base.tsv" bindf="$fwd/fwd_binds.tsv" statf="$fwd/fwd_static.tsv"
   local sif="$fwd/fwd_redis_si.tsv" depf="$fwd/redis_deployments.tsv"
   local clsf="$bwd/06_classified.tsv" ipsf="$bwd/redis_ips.tsv"
-  [ -s "$appf" ] || die "no $appf -- run: scan-apps <env> $fwd"
-  [ -s "$clsf" ] || die "no $clsf -- run the backward scan (run/reclassify) into $bwd"
+  # clear per-file check: say exactly what's missing and how to produce it
+  local miss=""
+  [ -s "$appf" ]  || miss="$miss\n  missing  $appf   -> run: scan-apps <env> --path $base"
+  [ -s "$bindf" ] || miss="$miss\n  missing  $bindf   -> run: scan-apps <env> --path $base"
+  [ -s "$statf" ] || miss="$miss\n  missing  $statf   -> run: scan-apps <env> --path $base"
+  [ -s "$sif" ]   || miss="$miss\n  missing  $sif   -> run: scan-apps <env> --path $base"
+  [ -s "$depf" ]  || miss="$miss\n  missing  $depf   -> run: list-redis <env> --path $base"
+  [ -s "$clsf" ]  || miss="$miss\n  missing  $clsf   -> run: run (or reclassify) <env> --path $base"
+  if [ -n "$miss" ]; then printf 'ERROR: merge cannot run -- required file(s) not found:%b\n' "$miss" >&2; exit 1; fi
+  [ -s "$ipsf" ] || echo "merge: note -- $ipsf absent; idle static-ref targets given only as an IP won't resolve to a service (shown as '?')"
 
   local SEP=' ' UNK3=$'?\t?\t?'
   declare -A APP_INFO SI_INFO DEP_OF_SI IP_TO_SI STAT_REF STAT_TGT
@@ -512,7 +530,7 @@ cmd_merge(){
     ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1
   done < "$clsf"
 
-  local out="$fwd/merged_report.csv"
+  local out="$base/merged_report.csv"
   echo "app_name,space,org,app_guid,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment,service_instance_guid,platform,deployment_exists,live_connection,source" > "$out"
 
   local aname aspace aorg sname sspace sorg depx live bound plat sref stgt method src
