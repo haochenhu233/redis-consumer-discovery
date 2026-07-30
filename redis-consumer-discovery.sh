@@ -500,35 +500,41 @@ cmd_merge(){
   if [ -n "$miss" ]; then printf 'ERROR: merge cannot run -- required file(s) not found:%b\n' "$miss" >&2; exit 1; fi
   [ -s "$ipsf" ] || echo "merge: note -- $ipsf absent; idle static-ref targets given only as an IP won't resolve to a service (shown as '?')"
 
-  local SEP=' ' UNK3=$'?\t?\t?'
+  # US = unit separator (0x1f): a NON-whitespace field delimiter. We extract only the columns we
+  # need with awk (which preserves EMPTY fields) and read them US-separated -- because plain
+  # `IFS=$'\t' read` COLLAPSES consecutive tabs (tab is IFS-whitespace), so a row with adjacent
+  # empty columns (e.g. blank static_ref + static_ref_target) shifts every later column left and
+  # the app_guid/redis_deployment we key on end up in the wrong field.
+  local SEP=' ' UNK3=$'?\t?\t?' US=$'\037'
   declare -A APP_INFO SI_INFO DEP_OF_SI IP_TO_SI STAT_REF STAT_TGT
   declare -A P_BIND P_LIVE P_PLAT P_METHB ALLKEYS APP_HAS_PAIR
-  local a b c d e key app si dep s2
+  local a b c d e key app si dep plat meth s2
 
   # reference maps
-  while IFS=$'\t' read -r a b c d e; do [ "$a" = env ] && continue; [ -n "$b" ] && APP_INFO["$b"]="$c"$'\t'"$d"$'\t'"$e"; done < "$appf"
-  [ -s "$sif" ]  && while IFS=$'\t' read -r a b c d e; do [ "$a" = service_instance_guid ] && continue; [ -n "$a" ] && SI_INFO["$a"]="$b"$'\t'"$c"$'\t'"$d"; done < "$sif"
+  while IFS="$US" read -r b c d e; do [ -n "$b" ] && APP_INFO["$b"]="$c"$'\t'"$d"$'\t'"$e"; done \
+    < <(awk -F'\t' 'NR>1{print $2 "\037" $3 "\037" $4 "\037" $5}' "$appf")
+  [ -s "$sif" ]  && while IFS="$US" read -r a b c d; do [ -n "$a" ] && SI_INFO["$a"]="$b"$'\t'"$c"$'\t'"$d"; done \
+    < <(awk -F'\t' 'NR>1{print $1 "\037" $2 "\037" $3 "\037" $4}' "$sif")
   [ -s "$depf" ] && while IFS=$'\t' read -r a b;       do [ "$a" = redis_deployment ] && continue; [ -n "$b" ] && DEP_OF_SI["$b"]="$a"; done < "$depf"
   [ -s "$ipsf" ] && while IFS=$'\t' read -r a b;       do [ -z "$b" ] && continue; s2=""; [ "${#a}" -ge 36 ] && s2="${a: -36}"; [ -n "$s2" ] && IP_TO_SI["$b"]="$s2"; done < "$ipsf"
   [ -s "$statf" ] && while IFS=$'\t' read -r a b c;    do [ "$a" = app_guid ] && continue; [ -n "$a" ] && { STAT_REF["$a"]="$b"; STAT_TGT["$a"]="$c"; }; done < "$statf"
 
-  # pairs from forward binds (declared cf-bind)
+  # pairs from forward binds (declared cf-bind). app_guid/si are the first two (non-empty) cols,
+  # so tab-collapse can't shift them -- plain read is safe here.
   [ -s "$bindf" ] && while IFS=$'\t' read -r app si c; do
     [ "$app" = app_guid ] && continue
     [ -n "$app" ] && [ -n "$si" ] && { key="$app$SEP$si"; P_BIND["$key"]=1; ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1; }
   done < "$bindf"
 
-  # pairs from backward 06_classified (live connection). cols: 5=platform 6=method 12=redis_deployment 13=app_guid
-  local c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14
-  while IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14; do
-    [ "$c1" = env ] && continue
-    app="$c13"; dep="$c12"
+  # pairs from backward 06_classified (live connection). app_guid(13)/redis_deployment(12) are in
+  # the MIDDLE -- extract via awk (US-separated) so blank static_ref cols can't shift them.
+  while IFS="$US" read -r app dep plat meth; do
     { [ -z "$app" ] || [ "$app" = "?" ]; } && continue
     si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"
     [ -z "$si" ] && continue
-    key="$app$SEP$si"; P_LIVE["$key"]=1; P_PLAT["$key"]="$c5"; P_METHB["$key"]="$c6"
+    key="$app$SEP$si"; P_LIVE["$key"]=1; P_PLAT["$key"]="$plat"; P_METHB["$key"]="$meth"
     ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1
-  done < "$clsf"
+  done < <(awk -F'\t' 'NR>1{print $13 "\037" $12 "\037" $5 "\037" $6}' "$clsf")
 
   local out="$base/merged_report.csv"
   echo "app_name,space,org,app_guid,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment,service_instance_guid,platform,deployment_exists,live_connection,source" > "$out"
