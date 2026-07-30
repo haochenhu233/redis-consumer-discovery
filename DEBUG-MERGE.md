@@ -104,9 +104,45 @@ echo "--- 3 sample forward keys  ---"; head -3 /tmp/fwd_keys.txt
 - If the sample keys look different in **format** (e.g. backward SI has extra chars, or the
   app_guid differs) → the join key derivation differs between scans.
 
+## Step 6 — minimal join repro (the decisive test)
+
+Step 3 uses `awk`; merge uses a bash `read` loop. If Step 3 says most rows are `ok` but merge
+still shows no live connections, run the **exact** loop merge uses and see what it produces:
+
+```bash
+cd <out>
+declare -A P_BIND P_LIVE ALLKEYS
+while IFS=$'\t' read -r app si rest; do
+  [ "$app" = app_guid ] && continue
+  [ -n "$app" ] && [ -n "$si" ] && { P_BIND["$app $si"]=1; ALLKEYS["$app $si"]=1; }
+done < forward/fwd_binds.tsv
+while IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14; do
+  [ "$c1" = env ] && continue
+  app="$c13"; dep="$c12"
+  { [ -z "$app" ] || [ "$app" = "?" ]; } && continue
+  si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"
+  [ -z "$si" ] && continue
+  P_LIVE["$app $si"]=1; ALLKEYS["$app $si"]=1
+done < backward/06_classified.tsv
+echo "P_BIND=${#P_BIND[@]}  P_LIVE=${#P_LIVE[@]}  ALLKEYS=${#ALLKEYS[@]}"
+fwd=0; bwd=0; both=0
+for k in "${!ALLKEYS[@]}"; do
+  L=no; [ -n "${P_LIVE[$k]:-}" ] && L=yes
+  B=no; [ -n "${P_BIND[$k]:-}" ] && B=yes
+  if [ "$B" = yes ] && [ "$L" = yes ]; then both=$((both+1)); elif [ "$B" = yes ]; then fwd=$((fwd+1)); else bwd=$((bwd+1)); fi
+done
+echo "source -> forward=$fwd  backward=$bwd  both=$both"
+```
+
+- **`P_LIVE` ≈ (Step-3 ok count)` and `backward`+`both` > 0** → the merge logic is correct; your
+  `merged_report.csv` was produced against a **different/empty** `06_classified.tsv`. Re-run
+  `merge np --path <out>` pointed at THIS directory.
+- **`P_LIVE=0`** → the bash loop skips what `awk` kept → a `\r`/whitespace bug in the loop. Send
+  the numbers; the fix is stripping `\r` from the fields.
+
 ---
 
 ## What to send back
 
-Paste the outputs of **Step 2, Step 3, and Step 4**. Those three pin it down:
-`06_classified.tsv` column count + the keep/skip categorization + the merged source split.
+Paste the outputs of **Step 2, Step 3, and Step 6**. Those pin it down: column count + the
+keep/skip categorization + whether the exact bash join produces live keys.
