@@ -496,8 +496,16 @@ cmd_merge(){
   [ -s "$statf" ] || miss="$miss\n  missing  $statf   -> run: scan-apps <env> --path $base"
   [ -s "$sif" ]   || miss="$miss\n  missing  $sif   -> run: scan-apps <env> --path $base"
   [ -s "$depf" ]  || miss="$miss\n  missing  $depf   -> run: list-redis <env> --path $base"
-  [ -s "$clsf" ]  || miss="$miss\n  missing  $clsf   -> run: run (or reclassify) <env> --path $base"
   if [ -n "$miss" ]; then printf 'ERROR: merge cannot run -- required file(s) not found:%b\n' "$miss" >&2; exit 1; fi
+  # BACKWARD data is OPTIONAL: an env with zero live connections (e.g. a DR env) never produces
+  # 06_classified.tsv -- the truthful merge is forward-only: every pair live_connection=no,
+  # source=forward. Warn instead of dying so DR envs still get a merged_report.
+  local fwd_only=""
+  if [ ! -s "$clsf" ] || [ "$(wc -l < "$clsf")" -le 1 ]; then
+    fwd_only=1
+    echo "merge: NOTE -- no backward data ($clsf missing/empty: zero live connections, e.g. a DR env)."
+    echo "merge:         forward-only merge: every pair will show live_connection=no, source=forward."
+  fi
   [ -s "$ipsf" ] || echo "merge: note -- $ipsf absent; idle static-ref targets given only as an IP won't resolve to a service (shown as '?')"
 
   # US = unit separator (0x1f): a NON-whitespace field delimiter. We extract only the columns we
@@ -528,13 +536,16 @@ cmd_merge(){
 
   # pairs from backward 06_classified (live connection). app_guid(13)/redis_deployment(12) are in
   # the MIDDLE -- extract via awk (US-separated) so blank static_ref cols can't shift them.
-  while IFS="$US" read -r app dep plat meth; do
-    { [ -z "$app" ] || [ "$app" = "?" ]; } && continue
-    si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"
-    [ -z "$si" ] && continue
-    key="$app$SEP$si"; P_LIVE["$key"]=1; P_PLAT["$key"]="$plat"; P_METHB["$key"]="$meth"
-    ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1
-  done < <(awk -F'\t' 'NR>1{print $13 "\037" $12 "\037" $5 "\037" $6}' "$clsf")
+  # Skipped entirely in forward-only mode (DR env: no backward data).
+  if [ -z "$fwd_only" ]; then
+    while IFS="$US" read -r app dep plat meth; do
+      { [ -z "$app" ] || [ "$app" = "?" ]; } && continue
+      si=""; [ "${#dep}" -ge 36 ] && si="${dep: -36}"
+      [ -z "$si" ] && continue
+      key="$app$SEP$si"; P_LIVE["$key"]=1; P_PLAT["$key"]="$plat"; P_METHB["$key"]="$meth"
+      ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1
+    done < <(awk -F'\t' 'NR>1{print $13 "\037" $12 "\037" $5 "\037" $6}' "$clsf")
+  fi
 
   local out="$base/merged_report.csv"
   echo "app_name,space,org,app_guid,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment,service_instance_guid,platform,deployment_exists,live_connection,source" > "$out"
