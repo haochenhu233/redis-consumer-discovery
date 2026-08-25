@@ -28,12 +28,19 @@ if [ -z "${RCD_OWNERS_OFFLINE:-}" ]; then
   rm -rf "$wdir"; mkdir -p "$wdir"
   timeout 30 cf curl "/v3/apps?per_page=1" >/dev/null 2>&1 || { echo "ERROR: cf not logged in"; exit 1; }
 
-  # paginate a v3 endpoint keeping BOTH resources and included.users (jsonl files)
+  # paginate a v3 endpoint keeping BOTH resources and included.users (jsonl files).
+  # Fails LOUDLY if the API returns an error document (bad query param, auth, ...) --
+  # otherwise a rejected query looks like an inexplicably empty output file.
   paginate(){ # $1=path $2=resources-out $3=users-out
     local next="$1"
     while [ -n "$next" ] && [ "$next" != "null" ]; do
       local page; page=$(timeout 60 cf curl "$next" 2>/dev/null)
       [ -z "$page" ] && break
+      if printf '%s' "$page" | jq -e '.errors? // empty' >/dev/null 2>&1; then
+        echo "ERROR: CF API rejected: $next" >&2
+        printf '%s' "$page" | jq -r '.errors[] | "  \(.title): \(.detail)"' >&2
+        exit 1
+      fi
       printf '%s' "$page" | jq -c '.resources[]?'      >> "$2"
       printf '%s' "$page" | jq -c '.included.users[]?' >> "$3" 2>/dev/null || true
       next=$(printf '%s' "$page" | jq -r '.pagination.next.href // "null"')
@@ -45,7 +52,7 @@ if [ -z "${RCD_OWNERS_OFFLINE:-}" ]; then
   : > "$wdir/orgs.jsonl"; : > "$wdir/spaces.jsonl"; : > "$wdir/roles.jsonl"; : > "$wdir/users.jsonl"
   paginate "/v3/organizations?per_page=200" "$wdir/orgs.jsonl"   /dev/null
   paginate "/v3/spaces?per_page=200"        "$wdir/spaces.jsonl" /dev/null
-  paginate "/v3/roles?types=organization_manager,space_manager,space_developer&per_page=200&include=users" \
+  paginate "/v3/roles?types=organization_manager,space_manager,space_developer&per_page=200&include=user" \
            "$wdir/roles.jsonl" "$wdir/users.jsonl"
 fi
 for x in orgs spaces roles users; do
