@@ -1,0 +1,8 @@
+# The scripts run on a Linux bastion. Force LF line endings on checkout so a Windows client with
+# core.autocrlf=true (the default on Windows git) does NOT inject CRLF -- CRLF breaks bash
+# (`\r` at the end of the shebang and every line) and forces a manual `sed -i 's/\r//'` each time.
+* text=auto eol=lf
+*.sh  text eol=lf
+*.ps1 text eol=lf
+*.md  text eol=lf
+*.tsv text eol=lf
