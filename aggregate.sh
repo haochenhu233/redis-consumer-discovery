@@ -15,7 +15,13 @@
 #
 # Why aggregate: repeated scans answer what one scan can't --
 #   1. is an app<->redis pair EVER live, or idle in every scan?  (ever_live)
-#   2. the union of all scans so no pair is missed               (every pair kept, flagged)
+#   2. the union of all scans so no pair is missed
+#
+# Pairs are identified by NAMES -- (org,space,app_name) <-> (svc org,space,name) -- which are
+# unique per space in CF, so a recreated app/service (new guid, same name) stays the SAME pair;
+# the guid change is recorded in the app/service_recreated columns instead of duplicating rows.
+# Output split: aggregated_report_*.csv = pairs present in the LATEST scan (with full history);
+# dropped_list_*.csv = pairs no longer present (unbound / deleted / renamed) -- nothing lost.
 # Pure file processing -- no env access needed (runs in the VDI).
 set -uo pipefail
 
@@ -60,8 +66,8 @@ n=$(printf '%s\n' "$files" | grep -c .)
 echo "aggregate: $n scan(s), oldest -> newest:"
 printf '%s\n' "$files" | sed 's/^/  /'
 
-OUTCSV="aggregated_report.csv"
-[ "$MODE" = "tree" ] && OUTCSV="aggregated_report_${ENVN}.csv"
+OUTCSV="aggregated_report.csv"; DROPCSV="dropped_list.csv"
+[ "$MODE" = "tree" ] && { OUTCSV="aggregated_report_${ENVN}.csv"; DROPCSV="dropped_list_${ENVN}.csv"; }
 
 printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 awk -v mode="$MODE" '
 BEGIN { FS=","; OFS="," }
@@ -79,36 +85,46 @@ FNR==1 {
 }
 {
   gsub(/\r$/, "")
-  if ($4=="" || $12=="" || $12=="?") next          # need both key halves
-  key=$4 SUBSEP $12
+  if ($1=="" || $4=="") next
+  # LOGICAL pair key: names, not guids -- app names are unique per space, service instance
+  # names unique per space, so a recreated app/service (new guid, same name) stays the SAME
+  # pair instead of duplicating. Guid churn is recorded as app/service_recreated instead.
+  appk = $3 SUBSEP $2 SUBSEP $1
+  svck = ($8!="" && $8!="?") ? ($10 SUBSEP $9 SUBSEP $8) : ("guid:" $12)   # unresolved name -> fall back to SI guid
+  key = appk SUBSEP svck
   if (!(key in first)) { first[key]=label[fileidx]; order[++np]=key }
   seen[key]++; last[key]=label[fileidx]; lastidx[key]=fileidx
   if ($15=="yes") live[key]++
   if (!((key SUBSEP $5) in mset)) { mset[key SUBSEP $5]=1
     methods[key]=(methods[key]=="") ? $5 : methods[key] "|" $5 }
+  if (!((key SUBSEP $4) in agset))  { agset[key SUBSEP $4]=1;  ag[key]++ }    # distinct app guids seen
+  if ($12!="" && !((key SUBSEP $12) in sgset)) { sgset[key SUBSEP $12]=1; sg[key]++ }  # distinct SI guids seen
   meta[key]=$1 OFS $2 OFS $3 OFS $4 OFS $5 OFS $6 OFS $7 OFS $8 OFS $9 OFS $10 OFS $11 OFS $12 OFS $13 OFS $14
   if (hasown) own[key]=$17 OFS $18 OFS $19
 }
 END {
-  print "app_name,space,org,app_guid,method,static_ref,static_ref_target," \
+  hdr = "app_name,space,org,app_guid,method,static_ref,static_ref_target," \
         "redis_service_name,redis_service_space,redis_service_org,redis_deployment," \
         "service_instance_guid,platform,deployment_exists," \
-        "scans_seen,scans_live,ever_live,in_latest,first_seen,last_seen,methods_seen," \
-        "org_managers,space_owners,owner_source"
+        "scans_seen,scans_live,ever_live,first_seen,last_seen,methods_seen," \
+        "app_recreated,service_recreated,org_managers,space_owners,owner_source"
+  print hdr > main
+  print hdr > dropped
   for (i=1; i<=np; i++) {
     k=order[i]
     ev=(live[k]>0) ? "yes" : "no"
-    il=(lastidx[k]==fileidx) ? "yes" : "no"
     o=(k in own) ? own[k] : OFS OFS
     ml=(index(methods[k],"|")>0) ? methods[k] : ""
-    print meta[k], seen[k], live[k]+0, ev, il, first[k], last[k], ml, o
-    if (ev=="yes") nlive++; else nidle++
-    if (il=="no") ngone++
-    if (ml!="") nflip++
+    ar=(ag[k]>1) ? "yes" : ""
+    sr=(sg[k]>1) ? "yes" : ""
+    row = meta[k] OFS seen[k] OFS live[k]+0 OFS ev OFS first[k] OFS last[k] OFS ml OFS ar OFS sr OFS o
+    if (lastidx[k]==fileidx) { print row > main;    nmain++;  if (ev=="yes") nlive++; else nidle++ }
+    else                     { print row > dropped; ndrop++ }
+    if (ar=="yes" || sr=="yes") nrec++
   }
-  printf "aggregate: %d distinct pair(s): %d ever-live, %d never-live (idle in every scan)\n", np, nlive+0, nidle+0 > "/dev/stderr"
-  printf "aggregate: %d pair(s) missing from the LATEST scan (unbound since? check before dropping)\n", ngone+0 > "/dev/stderr"
-  printf "aggregate: %d pair(s) changed classification across scans (methods_seen column)\n", nflip+0 > "/dev/stderr"
-}' > "$OUTCSV"
+  printf "aggregate: %d logical pair(s): %d current (-> main report: %d ever-live, %d never-live)\n", np, nmain+0, nlive+0, nidle+0 > "/dev/stderr"
+  printf "aggregate: %d pair(s) not in the latest scan -> dropped list (nothing lost)\n", ndrop+0 > "/dev/stderr"
+  printf "aggregate: %d pair(s) had their app or service recreated during the window (app/service_recreated columns)\n", nrec+0 > "/dev/stderr"
+}' main="$OUTCSV" dropped="$DROPCSV" /dev/null
 
-echo "aggregate: wrote $OUTCSV"
+echo "aggregate: wrote $OUTCSV (current pairs) and $DROPCSV (pairs no longer present)"
