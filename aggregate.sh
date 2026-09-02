@@ -1,24 +1,49 @@
 #!/usr/bin/env bash
 # aggregate.sh -- fold MULTIPLE scans of the same env into one activity-truth table.
-#     bash aggregate.sh <scan-base-dir> [<scan-base-dir> ...]
-#     bash aggregate.sh ./np-scan-*            # globs work
-# Each base dir is one scan (the --path base holding merged_report.csv; if owners.sh was run
-# there, merged_report_owners.csv is preferred automatically).
 #
-# Purpose: repeated scans answer two questions a single scan can't --
+# Primary form (scan archive tree:  <top>/<day>/<time-slot>/<env>/merged_report*.csv):
+#     bash aggregate.sh --path <top> --env <env-name>
+#         walks EVERY <day>/<time-slot> under <top>, but inside each slot takes ONLY the
+#         given env's directory -> aggregates all its merged reports.
+#         Output: aggregated_report_<env>.csv (current directory).
+#
+# Also accepted (explicit list of scan base dirs):
+#     bash aggregate.sh <scan-base-dir> [more ...]        # output: aggregated_report.csv
+#
+# Per scan dir the report is merged_report_owners.csv if present, else merged_report.csv.
+# Scans are ordered oldest -> newest by file mtime (newest wins for metadata/owners).
+#
+# Why aggregate: repeated scans answer what one scan can't --
 #   1. is an app<->redis pair EVER live, or idle in every scan?  (ever_live)
 #   2. the union of all scans so no pair is missed               (every pair kept, flagged)
-#
-# Output: aggregated_report.csv in the current directory. One row per DISTINCT
-# (app_guid, service_instance_guid) pair across ALL scans. Metadata/owners come from the
-# most recent scan containing the pair. Pure file processing -- no env access needed.
+# Pure file processing -- no env access needed (runs in the VDI).
 set -uo pipefail
 
-[ $# -ge 1 ] || { echo "usage: bash aggregate.sh <scan-base-dir> [more ...]"; exit 1; }
+TOP=""; ENVN=""; MODE="list"; DIRS=()
+while [ "${1:-}" ]; do
+  case "$1" in
+    --path) TOP="${2:-}"; shift 2 ;;
+    --env)  ENVN="${2:-}"; shift 2 ;;
+    -*) echo "ERROR: unknown option '$1'"; exit 1 ;;
+    *) DIRS+=("$1"); shift ;;
+  esac
+done
+
+if [ -n "$TOP" ] || [ -n "$ENVN" ]; then
+  [ -n "$TOP" ] && [ -n "$ENVN" ] || { echo "usage: bash aggregate.sh --path <top> --env <env-name>"; exit 1; }
+  [ -d "$TOP" ] || { echo "ERROR: no such directory: $TOP"; exit 1; }
+  MODE="tree"
+  for d in "$TOP"/*/*/"$ENVN"; do
+    [ -d "$d" ] && DIRS+=("$d")
+  done
+  [ ${#DIRS[@]} -gt 0 ] || { echo "ERROR: no '$ENVN' directories found under $TOP/*/*/ -- check --env spelling"; exit 1; }
+else
+  [ ${#DIRS[@]} -gt 0 ] || { echo "usage: bash aggregate.sh --path <top> --env <env>   |   bash aggregate.sh <scan-dir> [...]"; exit 1; }
+fi
 
 # collect one report file per scan dir, tagged with its mtime for ordering
 list=$(mktemp)
-for d in "$@"; do
+for d in "${DIRS[@]}"; do
   f=""
   [ -s "$d/merged_report_owners.csv" ] && f="$d/merged_report_owners.csv"
   [ -z "$f" ] && [ -s "$d/merged_report.csv" ] && f="$d/merged_report.csv"
@@ -29,19 +54,25 @@ for d in "$@"; do
 done
 [ -s "$list" ] || { echo "ERROR: no usable reports"; rm -f "$list"; exit 1; }
 
-files=$(sort -n "$list" | cut -f2)          # oldest -> newest (newest wins for metadata)
+files=$(sort -n "$list" | cut -f2)          # oldest -> newest
 rm -f "$list"
 n=$(printf '%s\n' "$files" | grep -c .)
 echo "aggregate: $n scan(s), oldest -> newest:"
 printf '%s\n' "$files" | sed 's/^/  /'
 
-# shellcheck disable=SC2086
-printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 awk '
+OUTCSV="aggregated_report.csv"
+[ "$MODE" = "tree" ] && OUTCSV="aggregated_report_${ENVN}.csv"
+
+printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 awk -v mode="$MODE" '
 BEGIN { FS=","; OFS="," }
 FNR==1 {
   fileidx++
-  # scan label = the base dir name of the report
-  lbl=FILENAME; sub(/\/[^\/]*$/, "", lbl); sub(/^.*\//, "", lbl); if (lbl=="") lbl=FILENAME
+  # scan label: tree mode -> "<day>/<time-slot>" (the two levels above the env dir);
+  # list mode -> the report,s parent dir name
+  m=split(FILENAME, seg, "/")
+  if (mode=="tree" && m>=4)      lbl=seg[m-3] "/" seg[m-2]
+  else if (m>=2)                 lbl=seg[m-1]
+  else                           lbl=FILENAME
   label[fileidx]=lbl
   hasown = ($0 ~ /org_managers/) ? 1 : 0
   next
@@ -78,6 +109,6 @@ END {
   printf "aggregate: %d distinct pair(s): %d ever-live, %d never-live (idle in every scan)\n", np, nlive+0, nidle+0 > "/dev/stderr"
   printf "aggregate: %d pair(s) missing from the LATEST scan (unbound since? check before dropping)\n", ngone+0 > "/dev/stderr"
   printf "aggregate: %d pair(s) changed classification across scans (methods_seen column)\n", nflip+0 > "/dev/stderr"
-}' > aggregated_report.csv
+}' > "$OUTCSV"
 
-echo "aggregate: wrote aggregated_report.csv"
+echo "aggregate: wrote $OUTCSV"
