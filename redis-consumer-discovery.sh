@@ -35,7 +35,7 @@ ENV=""; OUT="."; REDIS_DEP=""; CELL_INSTANCE="diego-cell/0"; SELF=""; PATH_BASE=
 #   <base>/forward/    -- scan-apps / list-redis / ghosts
 #   <base>/merged_report.csv  -- merge (works at the base level; reads backward/ + forward/)
 case "$SUB" in
-  _worker-*) : ;;                                   # workers run on-host; no <env>/flags
+  _worker-*|selftest) : ;;                          # workers run on-host; selftest needs no env
   *)
     ENV="${1:-}"; shift || true
     [ -z "$ENV" ] && { echo "ERROR: <env> is required"; exit 1; }
@@ -91,6 +91,31 @@ dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
 # "10.1.2.3:6379" and ss's v4-mapped form "[::ffff:10.1.2.3]:6379". Every place that
 # searches text for an IP MUST use this instead of grep -F (field bug: phantom rows).
 ip_re(){ printf '(^|[^0-9.])%s([^0-9.]|$)' "${1//./\\.}"; }
+
+# selftest: regression tests for text-matching helpers. No env needed:
+#     bash redis-consumer-discovery.sh selftest
+# Exists because of a field bug (2026-09-21): IPs matched as substrings -> phantom rows.
+cmd_selftest(){
+  local fail=0
+  t(){ # t <desc> <expected-line-count> <ip> <<< lines
+    local desc="$1" want="$2" ip="$3" got; got=$(grep -cE "$(ip_re "$ip")" || true)
+    if [ "$got" = "$want" ]; then echo "PASS  $desc"; else echo "FAIL  $desc (want $want, got $got)"; fail=1; fi; }
+  local ss=$'0 0 10.255.4.9:47632 10.237.1.84:6379\n0 0 10.255.4.9:47633 10.237.1.8:6379\n0 0 [::ffff:10.255.4.10]:5001 [::ffff:10.237.1.84]:6379\n0 0 10.255.4.9:5002 110.237.1.8:6379\n0 0 10.255.4.9:5003 10.237.1.80:6379'
+  t "ss: 10.237.1.8 matches only its own connection (not .84/.80/110.x)" 1 10.237.1.8   <<< "$ss"
+  t "ss: 10.237.1.84 matches plain + v4-mapped forms"                    2 10.237.1.84  <<< "$ss"
+  t "ss: 10.237.1.80 matches only itself"                                1 10.237.1.80  <<< "$ss"
+  t "ss: unknown IP matches nothing"                                     0 10.237.1.9   <<< "$ss"
+  local vms=$'diego-cell/aaaa running z1 10.237.2.50\ndiego-cell/bbbb running z1 10.237.2.5\ndiego-cell/cccc running z1 210.237.2.5'
+  t "bosh vms: peer 10.237.2.5 resolves to exactly one cell"             1 10.237.2.5   <<< "$vms"
+  t "env json: 10.237.1.84 in env is NOT a ref to 10.237.1.8"            0 10.237.1.8   <<< '{"var":{"REDIS_HOST":"10.237.1.84"}}'
+  t "env json: 10.237.1.8 in env IS a ref to 10.237.1.8"                 1 10.237.1.8   <<< '{"var":{"REDIS_HOST":"10.237.1.8"}}'
+  t "url form: redis://10.237.1.8:6379 is a ref to 10.237.1.8"           1 10.237.1.8   <<< 'redis://10.237.1.8:6379/0'
+  # resume check: deployment name must match as a whole field
+  local conns=$'np\tredis-cache-small-aaaa\t10.1.1.1\t6379\t10.2.2.2\t5\nnp\tredis-cache-small-aaaa-bbbb\t10.1.1.2\t6379\t10.2.2.3\t6'
+  if grep -qF -- $'\t'"redis-cache-small-aaaa"$'\t' <<< "$conns" && ! grep -qF -- $'\t'"redis-cache-small-aaa"$'\t' <<< "$conns"; then
+    echo "PASS  resume: deployment name matched as a whole field"; else echo "FAIL  resume: deployment name field match"; fail=1; fi
+  [ "$fail" = 0 ] && echo "selftest: ALL PASS" || { echo "selftest: FAILURES"; exit 1; }
+}
 
 cell_slug_for_ip(){ g_cf vms 2>/dev/null | grep -E "$(ip_re "$1")" \
   | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
@@ -231,7 +256,7 @@ cmd_run(){
   for d in "${DEPS[@]}"; do
     [ -z "$d" ] && continue
     i=$((i+1))
-    if [ -n "${RCD_RESUME:-}" ] && grep -qF "$d" "$f"; then
+    if [ -n "${RCD_RESUME:-}" ] && grep -qF -- $'\t'"$d"$'\t' "$f"; then   # whole field, not substring
       echo "[$i/$total] census $d :: SKIP (already censused)"; skipped=$((skipped+1)); continue
     fi
     # throttle to RCD_PAR concurrent censuses
@@ -1144,6 +1169,7 @@ case "$SUB" in
   resolve)         cmd_resolve ;;
   classify)        cmd_classify ;;
   report)          cmd_report ;;
+  selftest)        cmd_selftest ;;
   _worker-census)  _worker_census "$@" ;;
   _worker-sweep)   _worker_sweep "$@" ;;
   _worker-cfdot)   _worker_cfdot "$@" ;;

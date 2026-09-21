@@ -91,6 +91,8 @@ each team its rows using the `space_owners` addresses.
 
 ## Good to know
 
+- After updating the scripts, run `bash redis-consumer-discovery.sh selftest` once — it checks
+  the matching logic (no environment needed) and must print `ALL PASS`.
 - Re-running is always safe. Steps 3 and 4 can be re-run anytime without re-scanning.
 - Repeat Step 1 on another business day for better coverage of rarely-active apps.
 - The scripts need Unix (LF) line endings. If you ever see `\r: command not found`, run once:
