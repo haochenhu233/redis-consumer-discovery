@@ -174,6 +174,16 @@ somewhere only they can edit (droplet config, config repo, source). Platform sid
 the new Valkey details; the team changes their config in the same window — same playbook as
 the `external management` rows.
 
+## Before you book the session — rule out a phantom row
+
+Reports produced by scanner versions before 2026-09-21 could attribute a connection to the
+wrong Redis when one Redis IP is a **prefix of another** (`10.237.1.8` vs `10.237.1.84`):
+the app really is connected — to the *longer* IP's Redis, which it is bound to — and the
+`unknown` row for the shorter IP is a phantom. Tell-tale: Proof A shows a socket to a
+*different* Redis IP than the row names. Fix: `git pull`, run `reclassify <env> --path
+<base>` (re-sweeps the cells; no Redis re-scan), re-aggregate, and check whether the row
+survived before involving the app team.
+
 ## Safety notes
 
 - Proofs A–C and the why-steps 1–4 are read-only. Only step 5 (MONITOR) has any impact.

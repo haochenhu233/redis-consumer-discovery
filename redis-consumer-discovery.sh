@@ -86,7 +86,13 @@ CFDOT="${CFDOT:-cfdot}"
 dep_slug(){ g_dir -d "$1" instances 2>/dev/null \
   | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
 # cell instance slug (group/uuid) for a given cell IP, from the CF deployment vms
-cell_slug_for_ip(){ g_cf vms 2>/dev/null | grep -F "$1" \
+# ip_re <ip>: an ERE that matches the IP as a WHOLE address only -- not as a prefix/suffix of a
+# longer one (10.237.1.8 must NOT match 10.237.1.84 or 110.237.1.8). Works for plain
+# "10.1.2.3:6379" and ss's v4-mapped form "[::ffff:10.1.2.3]:6379". Every place that
+# searches text for an IP MUST use this instead of grep -F (field bug: phantom rows).
+ip_re(){ printf '(^|[^0-9.])%s([^0-9.]|$)' "${1//./\\.}"; }
+
+cell_slug_for_ip(){ g_cf vms 2>/dev/null | grep -E "$(ip_re "$1")" \
   | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1; }
 
 # cf_paginate <v3-path>: emit .resources[] (compact JSON, one per line) across ALL pages of a v3
@@ -711,7 +717,7 @@ cmd_sweep(){
   local cip cslug grp vline is_win cell_redis
   local launched=0 wlaunched=0 skipped_win=0 skipped_noslug=0
   for cip in $cell_ips; do
-    vline=$(printf '%s\n' "$vms" | grep -F "$cip" | head -1)
+    vline=$(printf '%s\n' "$vms" | grep -E "$(ip_re "$cip")" | head -1)
     cslug=$(printf '%s' "$vline" \
       | grep -oE '[a-z][a-z0-9_-]*/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
     [ -z "$cslug" ] && { echo "sweep: no cell instance for $cip (external/NAT?) - skipping"; skipped_noslug=$((skipped_noslug+1)); continue; }
@@ -951,7 +957,7 @@ cmd_classify(){
       # per app_guid and cache them; the per-redis pattern match is a cheap local grep.
       # precise signals (anchored to keep false positives low): redis IP, deployment name
       # (.bosh DNS), service GUID, a redis://|rediss://|valkey(s):// URL, or a REDIS*/VALKEY* key.
-      local pat="${rip//./\\.}|(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)"
+      local pat="$(ip_re "$rip")|(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)"
       [ "$dep" != "?" ] && [ -n "$dep" ] && pat="$pat|${dep}"
       [ -n "$si" ] && pat="$pat|${si}"
       [ -n "${ENVDATA[$ag]+x}" ] || ENVDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
@@ -1084,11 +1090,12 @@ _worker_sweep(){
     total=$((total+1))
     est=$(nsenter -t "$pid" -n ss -Htn state established 2>/dev/null)
     nl=$(printf '%s\n' "$est" | grep -c . )
-    # lines mentioning any redis IP (substring match; robust to v4-mapped-v6 format)
+    # lines whose peer is a redis IP -- WHOLE-address match (ip_re), never substring:
+    # 10.237.1.8 must not claim connections to 10.237.1.84 (field bug: phantom 'unknown' rows)
     local hitlines=""
     for rip in $redis_ips; do
       [ -z "$rip" ] && continue
-      line=$(printf '%s\n' "$est" | grep -F "$rip")
+      line=$(printf '%s\n' "$est" | grep -E "$(ip_re "$rip")")
       [ -n "$line" ] && hitlines="$hitlines$line"$'\n'
     done
     local hc; hc=$(printf '%s' "$hitlines" | grep -c . )
@@ -1111,7 +1118,7 @@ _worker_sweep(){
       [ -z "$line" ] && continue
       for rip in $redis_ips; do
         [ -z "$rip" ] && continue
-        printf '%s\n' "$line" | grep -qF "$rip" || continue
+        printf '%s\n' "$line" | grep -qE "$(ip_re "$rip")" || continue
         cip=$(printf '%s\n' "$line" | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | grep -vFx "$rip" | head -1)
         [ -n "$dbg" ] && printf '#DBG#\tMATCH ns=%s cip=%s rip=%s :: %s\n' "$ino" "${cip:-?}" "$rip" "$line"
         [ -n "$cip" ] && printf '#RCD#\t%s\t%s\t%s\n' "$cip" "${guid:-NOGUID}" "$rip"
