@@ -94,6 +94,11 @@ each team its rows using the `space_owners` addresses.
 - After updating the scripts, run `bash redis-consumer-discovery.sh selftest` once — it checks
   the matching logic (no environment needed) and must print `ALL PASS`.
 - Re-running is always safe. Steps 3 and 4 can be re-run anytime without re-scanning.
+- To see exactly what changed between two reports (after a script update or a re-scan):
+  `bash compare-reports.sh <old>/merged_report.csv <new>/merged_report.csv` — prints a summary
+  and writes `removed.csv` (rows that disappeared), `added.csv` (newly found consumers),
+  `changed.csv` (old vs new side by side) and `hazards-cleared.csv` (flags that turned out to
+  be false — do not contact those teams).
 - Repeat Step 1 on another business day for better coverage of rarely-active apps.
 - The scripts need Unix (LF) line endings. If you ever see `\r: command not found`, run once:
   `sed -i 's/\r$//' redis-consumer-discovery.sh owners.sh`
