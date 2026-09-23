@@ -125,10 +125,89 @@ sudo tr '\0' '\n' < /proc/<pid>/environ | grep -E '^VCAP_APPLICATION=' \
 Same 4-tuple as Proofs A and B, with the app's name on the owning process. Case closed on
 *whether* — now the interesting part.
 
-*(Windows apps: `cf ssh` and netns don't apply — on the Windows cell use the WinNAT table
-instead: `powershell "Get-NetNatSession | Where-Object {$_.DestinationAddress -eq
-'<REDIS_IP>'}"` — `InternalSourceAddress` is the container; this is exactly what
-`windows-wsweep.ps1` automates.)*
+---
+
+## Windows apps — the same three proofs, different tools
+
+Windows containers (winc) have no network namespaces to walk; instead the cell **source-NATs**
+every container connection through WinNAT, and the NAT session table is the bridge. Step 0
+(variables, the binding/env absence check) is identical. `cf ssh` works for Windows apps if
+ssh is enabled (`cf ssh-enabled "$APP"`); it drops you into `cmd.exe` — type `powershell` first.
+
+### Proof A (Windows) — inside the app's container
+
+```powershell
+cf ssh <app>
+powershell
+netstat -ano | findstr ":6379"            # always available; last column = owning PID
+# or, nicer:
+Get-NetTCPConnection -State Established | Where-Object { $_.RemoteAddress -eq '<REDIS_IP>' } |
+  Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess
+ipconfig | findstr IPv4                    # the CONTAINER IP -- note it, it links to Proof C
+```
+
+The socket to `<REDIS_IP>:6379` seen from inside the app's own container. Note the **LocalPort**
+(container-side port) and the container IP. Owning process:
+
+```powershell
+Get-Process -Id <OwningProcess> | Select-Object Id, ProcessName, Path
+Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" | Select-Object CommandLine
+```
+
+### Proof B (Windows) — from the Redis VM
+
+Exactly as for Linux (`sudo ss -Htn state established "sport = :6379"` on the Redis VM). The
+peer IP is the **Windows cell's IP** (WinNAT SNAT), and the peer **port is rewritten** by NAT —
+so unlike Linux, don't expect the container-side port to match. Which cell hosts the instance:
+
+```bash
+cf curl "/v3/processes/$APP_GUID/stats" | jq -r '.resources[] | "\(.index) \(.host)"'
+```
+
+### Proof C (Windows) — the WinNAT session table on the cell (definitive)
+
+On the Windows cell whose IP matched (`genesis @<env>:cf b ssh <windows-cell>/<uuid>` — the
+session is cmd/PowerShell; commands below are PowerShell):
+
+```powershell
+Get-NetNatSession | Where-Object {
+    $_.InternalDestinationAddress -eq '<REDIS_IP>' -or $_.ExternalDestinationAddress -eq '<REDIS_IP>'
+} | Select-Object InternalSourceAddress, InternalSourcePort, ExternalSourceAddress, ExternalSourcePort, ExternalDestinationAddress
+```
+
+Read the row as the **full bridge**:
+- `InternalSourceAddress` / `InternalSourcePort` = the container IP and port — must equal what
+  Proof A showed from inside (`ipconfig` + `LocalPort`);
+- `ExternalSourceAddress` / `ExternalSourcePort` = the cell IP and NAT'ed port — must equal the
+  peer Redis reported in Proof B.
+
+Same connection seen at all three points; the container IP ties it to the app. (This is
+exactly what `windows-wsweep.ps1` automates. Note: container IPs like `172.30.x.x` repeat on
+every Windows cell — only the (cell, container IP) pair identifies an instance, which is why
+Proof B's cell match matters.)
+
+If the app has several instances and you need to confirm *which* container is which app from
+the cell side: `Get-HnsEndpoint | Select-Object IPAddress, VirtualNetworkName, ID` maps IPs to
+container endpoints; the container handle prefix equals the first 28 characters of the
+instance guid in `cf curl "/v3/processes/$APP_GUID/stats"` (`.resources[].instance_guid` on
+newer CAPI) — or simply compare against `ipconfig` from Proof A.
+
+### Finding the WHY on Windows
+
+Inside `cf ssh` (PowerShell), the app lives under `C:\Users\vcap\app`:
+
+```powershell
+Select-String -Path C:\Users\vcap\app\* -Pattern '<REDIS_IP>|redis' -List -ErrorAction SilentlyContinue |
+  Select-Object Path, LineNumber, Line
+# .NET apps -- the usual homes for a pasted address:
+Get-ChildItem -Recurse C:\Users\vcap\app -Include appsettings*.json, web.config, *.config |
+  Select-String -Pattern '<REDIS_IP>|redis|6379'
+Get-ChildItem Env: | Where-Object { $_.Value -match '<REDIS_IP>|redis' }   # env as the process sees it
+```
+
+The same why-list applies (droplet-baked config → external config → source → leftover
+unbind). For .NET specifically, `appsettings.<Environment>.json` and `connectionStrings` in
+`web.config` account for almost all cases.
 
 ---
 
