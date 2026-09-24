@@ -45,6 +45,22 @@ No binding, no env reference — and yet, next, a live socket.
 
 ---
 
+## Which port? 6379 — or 16379 for TLS
+
+Redis instances run in **dual mode**: plaintext on `6379` and **TLS on `16379`** (native
+`tls-port` in redis.conf; the binding credentials carry both `port` and `tls_port`). A
+`findstr`/`grep` on `6379` finds nothing for an app that connects over TLS — filter on the
+**Redis IP**, not the port, in every proof, and check both ports on the Redis VM:
+
+```bash
+sudo ss -Htn state established "( sport = :6379 or sport = :16379 )"
+```
+
+An app on `16379` is a **TLS consumer** — note it on the session record: its Valkey target must
+be a TLS-enabled plan, and the app must trust the new instance's certificate (per-instance
+certs are issued by the platform's services CA). That is a migration requirement in its own
+right, separate from how the app learned the address.
+
 ## Proof A — from inside the app's own container (the convincing one)
 
 ```bash
@@ -139,7 +155,7 @@ ssh is enabled (`cf ssh-enabled "$APP"`); it drops you into `cmd.exe` — type `
 ```powershell
 cf ssh <app>
 powershell
-netstat -ano | findstr ":6379"            # always available; last column = owning PID
+netstat -ano | findstr "<REDIS_IP>"       # NOT the port: TLS consumers use 16379; last column = owning PID
 # or, nicer:
 Get-NetTCPConnection -State Established | Where-Object { $_.RemoteAddress -eq '<REDIS_IP>' } |
   Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess
@@ -244,8 +260,8 @@ how often it's the answer:
 
 ## Record the session
 
-| # | app | redis | binding? | socket inside (A) | redis-side peer (B) | cell bridge (C) | owning process | why (1–5) | migration action |
-|---|-----|-------|----------|-------------------|---------------------|-----------------|----------------|-----------|------------------|
+| # | app | redis | binding? | port (6379 / 16379 TLS) | socket inside (A) | redis-side peer (B) | cell bridge (C) | owning process | why (1–5) | migration action |
+|---|-----|-------|----------|--------------------------|-------------------|---------------------|-----------------|----------------|-----------|------------------|
 |   |     |       | 0        | ✓ port …          | ✓ cell …            | ✓ / skipped     |                |           |                  |
 
 The **migration action** for a confirmed `unknown` is always team-side: the address lives
