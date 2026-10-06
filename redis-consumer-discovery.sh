@@ -110,6 +110,14 @@ cmd_selftest(){
   t "env json: 10.237.1.84 in env is NOT a ref to 10.237.1.8"            0 10.237.1.8   <<< '{"var":{"REDIS_HOST":"10.237.1.84"}}'
   t "env json: 10.237.1.8 in env IS a ref to 10.237.1.8"                 1 10.237.1.8   <<< '{"var":{"REDIS_HOST":"10.237.1.8"}}'
   t "url form: redis://10.237.1.8:6379 is a ref to 10.237.1.8"           1 10.237.1.8   <<< 'redis://10.237.1.8:6379/0'
+  # api_err: an error document / junk / empty must NEVER look like a good (empty) response
+  ae(){ local desc="$1" want="$2" got; got=$(api_err "$3"); if { [ "$want" = none ] && [ -z "$got" ]; } || { [ "$want" = some ] && [ -n "$got" ]; }; then echo "PASS  $desc"; else echo "FAIL  $desc (got: $got)"; fail=1; fi; }
+  ae "api_err: good list response -> no error"            none '{"pagination":{"total_results":0},"resources":[]}'
+  ae "api_err: good object response -> no error"          none '{"var":{"A":"b"}}'
+  ae "api_err: CF error document -> error text"           some '{"errors":[{"title":"CF-BadQueryParameter","detail":"The query parameter is invalid: Unknown query parameter(s)"}]}'
+  ae "api_err: not-authorized document -> error text"     some '{"errors":[{"title":"CF-NotAuthorized","detail":"You are not authorized to perform the requested action"}]}'
+  ae "api_err: empty response -> error text"              some ''
+  ae "api_err: non-JSON (HTML error page) -> error text"  some '<html>502 Bad Gateway</html>'
   # resume check: deployment name must match as a whole field
   local conns=$'np\tredis-cache-small-aaaa\t10.1.1.1\t6379\t10.2.2.2\t5\nnp\tredis-cache-small-aaaa-bbbb\t10.1.1.2\t6379\t10.2.2.3\t6'
   if grep -qF -- $'\t'"redis-cache-small-aaaa"$'\t' <<< "$conns" && ! grep -qF -- $'\t'"redis-cache-small-aaa"$'\t' <<< "$conns"; then
@@ -123,12 +131,30 @@ cell_slug_for_ip(){ g_cf vms 2>/dev/null | grep -E "$(ip_re "$1")" \
 # cf_paginate <v3-path>: emit .resources[] (compact JSON, one per line) across ALL pages of a v3
 # list endpoint, following pagination.next. Used by the forward scan (scan-apps). Uses the current
 # `cf` session -- no genesis/bosh.
+# api_err <json>: the CF API's own error text if the response is an error document, not JSON, or
+# empty; prints NOTHING for a good response. RULE: every cf curl result goes through this (or a
+# shape check) before it is used -- an error must never be read as "empty list" / "0" / "no match".
+api_err(){ local j="$1"
+  [ -z "$j" ] && { echo "empty response (timeout / not logged in?)"; return; }
+  printf '%s' "$j" | jq -e . >/dev/null 2>&1 || { echo "non-JSON response"; return; }
+  printf '%s' "$j" | jq -r 'if type=="object" and has("errors") then [.errors[] | "\(.title // "error"): \(.detail // "")"] | join("; ") else empty end' 2>/dev/null; }
+# api_fail <what> <error>: report loudly AND record in $OUT/.api_errors. Needed because most calls
+# run inside pipelines / background workers, where exit cannot stop the parent; the command checks
+# the marker file and fails at the end.
+api_fail(){ echo "!! CF API ERROR: $1 -- $2" >&2; printf '%s\t%s\n' "$1" "$2" >> "${OUT:-.}/.api_errors"; }
+api_errors_check(){ # <command-name>: fail if any API error was recorded
+  [ -s "${OUT:-.}/.api_errors" ] || return 0
+  echo "!! $1: $(wc -l < "$OUT/.api_errors" | tr -d ' ') CF API error(s) -- results are INCOMPLETE. First few:" >&2
+  head -5 "$OUT/.api_errors" | sed 's/^/     /' >&2
+  return 1; }
+
 cf_paginate(){
   local next="$1"
   while [ -n "$next" ] && [ "$next" != "null" ]; do
-    local page; page=$(timeout 60 cf curl "$next" 2>/dev/null)
-    [ -z "$page" ] && break
-    printf '%s' "$page" | jq -c '.resources[]?' 2>/dev/null
+    local page e; page=$(timeout 60 cf curl "$next" 2>/dev/null)
+    e=$(api_err "$page"); [ -n "$e" ] && { api_fail "$next" "$e"; return 1; }
+    printf '%s' "$page" | jq -e 'type=="object" and has("resources")' >/dev/null 2>&1 || { api_fail "$next" "response has no .resources"; return 1; }
+    printf '%s' "$page" | jq -c '.resources[]'
     next=$(printf '%s' "$page" | jq -r '.pagination.next.href // "null"' 2>/dev/null)
     [ "$next" != "null" ] && [ -n "$next" ] && next="/v3/${next#*/v3/}"   # strip host -> path for cf curl
   done
@@ -302,6 +328,7 @@ cmd_run(){
   cmd_classify || die "classify failed"
   cmd_report
   echo; echo "== done :: $OUT/redis_consumers.txt =="
+  api_errors_check "run" || exit 3
 }
 
 # reclassify: re-run phase 2 (sweep -> resolve -> classify -> report) from an EXISTING
@@ -317,6 +344,7 @@ cmd_reclassify(){
   cmd_classify || die "classify failed"
   cmd_report
   echo; echo "== done :: $OUT/redis_consumers.txt =="
+  api_errors_check "reclassify" || exit 3
 }
 
 # _scan_app_static <app_guid> <outfile>: STEP-3 per-app worker (parallel-safe). Fetch the app's
@@ -328,8 +356,12 @@ _scan_app_static(){
   local ag="$1" out="$2"
   local gpat='(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)'
   local env man sr="" tgt=""
-  env=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
-  man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
+  local e errf; errf="$(dirname "$out")/../.env_errors"
+  env=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null); e=$(api_err "$env")
+  [ -n "$e" ] && { sleep 1; env=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null); e=$(api_err "$env"); }   # one retry
+  [ -n "$e" ] && { printf '%s\t%s\n' "$ag" "$e" >> "$errf"; return 0; }      # unreadable env: recorded, NOT treated as "no static ref"
+  man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null); e=$(api_err "$man")
+  [ -n "$e" ] && { printf '%s\t%s\n' "$ag" "$e" >> "$(dirname "$out")/../.man_errors"; man=""; }
   if printf '%s' "$env" | grep -qiE "$gpat" 2>/dev/null; then sr="env-var"
   elif printf '%s' "$man" | grep -qiE "$gpat" 2>/dev/null; then sr="manifest"; fi
   [ -z "$sr" ] && return 0                              # no static redis ref -> nothing to record
@@ -351,12 +383,14 @@ cmd_scan_apps(){
   command -v jq >/dev/null || die "jq required on the bastion"
   timeout 30 cf curl "/v3/apps?per_page=1" >/dev/null 2>&1 || die "cf not logged in / not targeted (scan-apps uses the current cf session)"
   echo "scan-apps :: forward scan (CF API, current cf target)"
+  rm -f "$OUT/.api_errors" "$OUT/.env_errors" "$OUT/.man_errors" "$OUT/fwd_static.INCOMPLETE"
 
   # orgs: guid -> name
   declare -A ORG_NAME
   local og on
   while IFS=$'\t' read -r og on; do [ -n "$og" ] && ORG_NAME["$og"]="$on"; done < <(
     cf_paginate "/v3/organizations?per_page=200" | jq -r '[.guid, .name] | @tsv')
+  api_errors_check "scan-apps (organizations)" || die "scan-apps aborted: the CF API rejected the organizations query"
   echo "scan-apps: ${#ORG_NAME[@]} org(s)"
 
   # spaces: guid -> space_name \t org_name
@@ -365,6 +399,7 @@ cmd_scan_apps(){
   while IFS=$'\t' read -r sg sn sog; do
     [ -n "$sg" ] && SPACE_INFO["$sg"]="$sn"$'\t'"${ORG_NAME[$sog]:-?}"
   done < <(cf_paginate "/v3/spaces?per_page=200" | jq -r '[.guid, .name, .relationships.organization.data.guid] | @tsv')
+  api_errors_check "scan-apps (spaces)" || die "scan-apps aborted: the CF API rejected the spaces query"
   echo "scan-apps: ${#SPACE_INFO[@]} space(s)"
 
   # apps: guid, name, space -> app_base.tsv
@@ -379,6 +414,7 @@ cmd_scan_apps(){
     n=$((n+1))
   done < <(cf_paginate "/v3/apps?per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid] | @tsv')
 
+  api_errors_check "scan-apps (orgs/spaces/apps)" || die "scan-apps aborted: the CF API rejected a list query -- the app inventory would be incomplete"
   local total; total=$(timeout 30 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq -r '.pagination.total_results // "?"' 2>/dev/null)
   echo "scan-apps: enumerated $n app(s) -> $out"
   echo "scan-apps: CF API reports total_results=$total  (should match $n)"
@@ -420,6 +456,8 @@ cmd_scan_apps(){
   done < <(cf_paginate "/v3/service_credential_bindings?type=app&per_page=200" | jq -r '[.relationships.app.data.guid, .relationships.service_instance.data.guid] | @tsv')
   echo "scan-apps: $nb cf-bind app<->redis binding(s) -> $bout"
 
+  api_errors_check "scan-apps (bulk lists)" || die "scan-apps aborted: the CF API rejected a list query -- apps/bindings would be incomplete"
+
   # STEP 3: per-app static-ref (env vars / manifest). One env + one manifest curl per app, run as a
   # bounded pool (RCD_PAR). NEEDS a cf role that can read env vars (full admin / Space Developer);
   # a read-only/auditor role silently yields no static refs. At 5-6k apps this is the slow phase.
@@ -439,6 +477,15 @@ cmd_scan_apps(){
   cat "$sdir"/*.tsv 2>/dev/null >> "$sout"
   local nstat; nstat=$(($(wc -l < "$sout") - 1))
   echo "scan-apps: checked $i app(s) for static refs (par=$par), $nstat with a static redis ref -> $sout"
+  local nenv=0 nman=0; [ -s "$OUT/.env_errors" ] && nenv=$(wc -l < "$OUT/.env_errors" | tr -d ' '); [ -s "$OUT/.man_errors" ] && nman=$(wc -l < "$OUT/.man_errors" | tr -d ' ')
+  [ "$nman" -gt 0 ] && echo "scan-apps: note -- manifest unreadable for $nman app(s) (env was read; static-ref from env still valid)"
+  if [ "$nenv" -gt 0 ]; then
+    printf '%s app(s) of %s: environment unreadable\t%s\n' "$nenv" "$i" "$(cut -f2 "$OUT/.env_errors" | sort | uniq -c | sort -rn | head -1 | sed 's/^ *//')" > "$OUT/fwd_static.INCOMPLETE"
+    echo "!! scan-apps: environment UNREADABLE for $nenv of $i app(s) -- static_ref results are INCOMPLETE" >&2
+    echo "   most common reason: $(cut -f2 "$OUT/.env_errors" | sort | uniq -c | sort -rn | head -1 | sed 's/^ *//')" >&2
+    echo "   (reading env vars needs cloud_controller.admin or Space Developer; admin_read_only is denied)" >&2
+    exit 3
+  fi
 }
 
 # list-redis: authoritative BOSH redis deployment list -> $OUT/redis_deployments.tsv
@@ -537,6 +584,7 @@ cmd_merge(){
     echo "merge: NOTE -- no backward data ($clsf missing/empty: zero live connections, e.g. a DR env)."
     echo "merge:         forward-only merge: every pair will show live_connection=no, source=forward."
   fi
+  [ -s "$fwd/fwd_static.INCOMPLETE" ] && echo "!! merge: the forward static-ref scan was INCOMPLETE ($(cut -f1 "$fwd/fwd_static.INCOMPLETE")) -- static_ref columns are unreliable until scan-apps is re-run with a role that can read env vars" >&2
   [ -s "$ipsf" ] || echo "merge: note -- $ipsf absent; idle static-ref targets given only as an IP won't resolve to a service (shown as '?')"
 
   # US = unit separator (0x1f): a NON-whitespace field delimiter. We extract only the columns we
@@ -906,6 +954,7 @@ _extract_redis_hosts(){
 # this row's redis (env/manifest target host != this redis IP), resolved to a service name if
 # that target is itself a censused redis. Blank = the static ref matches this row's redis.
 cmd_classify(){
+  rm -f "$OUT/.api_errors"; declare -A ENVERR
   local apps="$OUT/05_apps.tsv" conns="$OUT/02_conns.tsv"
   [ -s "$apps" ]  || die "no $apps; run resolve first"
   [ -s "$conns" ] || die "no $conns; run census first"
@@ -975,7 +1024,11 @@ cmd_classify(){
     else
       # binding to THIS instance? (only checkable if we resolved the service GUID)
       bcount=0
-      [ -n "$si" ] && bcount=$(timeout 20 cf curl "/v3/service_credential_bindings?app_guids=$ag&service_instance_guids=$si&per_page=1" 2>/dev/null | jq -r '.pagination.total_results // 0' 2>/dev/null)
+      if [ -n "$si" ]; then
+        local bj; bj=$(timeout 20 cf curl "/v3/service_credential_bindings?app_guids=$ag&service_instance_guids=$si&per_page=1" 2>/dev/null)
+        if printf '%s' "$bj" | jq -e '.pagination.total_results' >/dev/null 2>&1; then bcount=$(printf '%s' "$bj" | jq -r '.pagination.total_results')
+        else bcount="ERR"; api_fail "bindings app=$ag si=$si" "$(api_err "$bj")"; fi     # an error is NOT "0 bindings"
+      fi
 
       # static redis/valkey signal -- computed ALWAYS (even for cf-bind), so a bound app that
       # ALSO hardcodes redis is flagged (it won't cut over on rebind). Fetch env+manifest once
@@ -985,14 +1038,19 @@ cmd_classify(){
       local pat="$(ip_re "$rip")|(redis|valkey)s?://|(REDIS|VALKEY)[_A-Z0-9]*(HOST|HOSTNAME|URL|URI|ADDR|ENDPOINT|SERVER|NODE|PORT)"
       [ "$dep" != "?" ] && [ -n "$dep" ] && pat="$pat|${dep}"
       [ -n "$si" ] && pat="$pat|${si}"
-      [ -n "${ENVDATA[$ag]+x}" ] || ENVDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
-      [ -n "${MANDATA[$ag]+x}" ] || MANDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
+      if [ -z "${ENVDATA[$ag]+x}" ]; then
+        ENVDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
+        local ee; ee=$(api_err "${ENVDATA[$ag]}"); [ -n "$ee" ] && { ENVERR[$ag]=1; api_fail "environment app=$ag" "$ee"; }
+        MANDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
+        ee=$(api_err "${MANDATA[$ag]}"); [ -n "$ee" ] && MANDATA[$ag]=""
+      fi
       in_env=""; in_man=""
       printf '%s' "${ENVDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_env=1
       printf '%s' "${MANDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_man=1
       # env-var wins over manifest (the reconstructed manifest also contains the env: block, so
       # an env match shows up in both -- attribute it to env-var, not manifest).
       if [ -n "$in_env" ]; then staticref="env-var"; elif [ -n "$in_man" ]; then staticref="manifest"; fi
+      [ -n "${ENVERR[$ag]:-}" ] && staticref="unreadable"     # env could not be read: say so, do not imply "no static ref"
 
       # static_ref_target: when the app statically references a redis, find the target host it
       # points at; if that host is NOT this row's redis IP, surface it (resolved to a service
@@ -1022,7 +1080,8 @@ cmd_classify(){
       fi
 
       # primary method: bind wins; else the static reference; else nothing visible -> unknown
-      if [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then method="cf-bind"
+      if [ "$bcount" = "ERR" ]; then method="api-error"         # binding lookup failed: visible, never "unknown"
+      elif [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then method="cf-bind"
       elif [ "$staticref" = "env-var" ];  then method="static-ref: env-var"
       elif [ "$staticref" = "manifest" ]; then method="static-ref: manifest"
       else method="unknown"; fi
@@ -1031,6 +1090,7 @@ cmd_classify(){
   done < "$apps"
 
   echo "classify: results in $out"
+  api_errors_check "classify" || echo "   rows affected carry method=api-error or static_ref=unreadable -- re-run reclassify after fixing access" >&2
   column -t -s$'\t' "$out" 2>/dev/null || cat "$out"
 }
 
