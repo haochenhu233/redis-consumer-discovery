@@ -722,6 +722,23 @@ cmd_merge(){
   local out="$base/merged_report.csv"
   echo "app_name,space,org,app_guid,method,static_ref,static_ref_target,redis_service_name,redis_service_space,redis_service_org,redis_deployment,service_instance_guid,platform,deployment_exists,live_connection,source" > "$out"
 
+  # annotate a static target host list ("h1;h2") with the service each host resolves to:
+  # an IP via the census IP map, a BOSH-DNS name via the deployment name it contains.
+  # "[svc]" = one of our redis; "(this)" = the row's own redis (the usual, consistent case).
+  _annot_targets(){ local list="$1" rowsi="$2" h out="" rsi n
+    [ -z "$list" ] && return 0
+    while IFS= read -r h; do
+      [ -z "$h" ] && continue; rsi=""
+      if [ -n "${IP_TO_SI[$h]:-}" ]; then rsi="${IP_TO_SI[$h]}"
+      else for n in "${!DEP_OF_SI[@]}"; do [[ "$h" == *"${DEP_OF_SI[$n]}"* ]] && { rsi="$n"; break; }; done; fi
+      if [ -n "$rsi" ]; then
+        IFS=$'\t' read -r sname _ _ <<< "${SI_INFO[$rsi]:-$UNK3}"
+        [ "$rsi" = "$rowsi" ] && h="$h [$sname (this)]" || h="$h [$sname]"
+      fi
+      out="${out:+$out;}$h"
+    done < <(printf '%s' "$list" | tr ';' '\n')
+    printf '%s' "$out"; }
+
   local aname aspace aorg sname sspace sorg depx live bound plat sref stgt method src
   for key in "${!ALLKEYS[@]}"; do
     app="${key% *}"; si="${key#* }"
@@ -731,7 +748,7 @@ cmd_merge(){
     live="no"; [ -n "${P_LIVE[$key]:-}" ] && live="yes"
     bound="no"; [ -n "${P_BIND[$key]:-}" ] && bound="yes"
     plat="${P_PLAT[$key]:-}"
-    sref="${STAT_REF[$app]:-}"; stgt="${STAT_TGT[$app]:-}"
+    sref="${STAT_REF[$app]:-}"; stgt="$(_annot_targets "${STAT_TGT[$app]:-}" "$si")"
     # a UPS pointing at this redis is a static reference too (frozen copy of the creds); it loses
     # to env-var/manifest only in the static_ref label -- the target column names the UPS.
     if [ -n "${P_UPS[$key]:-}" ] && [ -z "$sref" ]; then sref="ups"; stgt="${P_UPS[$key]}"; fi
