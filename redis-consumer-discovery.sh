@@ -1159,11 +1159,18 @@ cmd_classify(){
         while IFS= read -r _h; do
           _h="${_h%%[[:space:]]*}"; [ -z "$_h" ] && continue
           [ "$_h" = "$rip" ] && continue                 # matches this row's redis -> consistent
+          # BOSH DNS form (<vm-uuid>.<group>.<net>.<deployment>.bosh, what a service key hands out)
+          # names the deployment -> same redis as this row => consistent too
+          [ -n "$dep" ] && [ "$dep" != "?" ] && [[ "$_h" == *"$dep"* ]] && continue
           _div="$_h"; break                               # first host that differs -> the target
         done <<< "$_hosts"
         if [ -n "$_div" ]; then
-          if [ -n "${DEP_BY_IP[$_div]:-}" ]; then         # target IP is itself a censused redis
-            _odep="${DEP_BY_IP[$_div]}"; _osi=""; [ "${#_odep}" -ge 36 ] && _osi="${_odep: -36}"
+          _odep="${DEP_BY_IP[$_div]:-}"
+          if [ -z "$_odep" ]; then                        # a DNS name naming ANOTHER censused deployment?
+            local _d2; for _d2 in "${DEP_BY_IP[@]}"; do [[ "$_div" == *"$_d2"* ]] && { _odep="$_d2"; break; }; done
+          fi
+          if [ -n "$_odep" ]; then                        # target is itself a censused redis
+            _osi=""; [ "${#_odep}" -ge 36 ] && _osi="${_odep: -36}"
             _osvc="?"
             if [ -n "$_osi" ]; then
               if [ -n "${SVCINFO[$_osi]:-}" ]; then IFS=$'\t' read -r _osvc _ _ <<< "${SVCINFO[$_osi]}"
