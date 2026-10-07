@@ -736,7 +736,7 @@ cmd_merge(){
         [ "$rsi" = "$rowsi" ] && h="$h [$sname (this)]" || h="$h [$sname]"
       fi
       out="${out:+$out;}$h"
-    done < <(printf '%s' "$list" | tr ';' '\n')
+    done < <(printf '%s\n' "$list" | tr ';' '\n')
     printf '%s' "$out"; }
 
   local aname aspace aorg sname sspace sorg depx live bound plat sref stgt method src
