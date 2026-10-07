@@ -52,7 +52,7 @@ case "$SUB" in
     PATH_BASE="${PATH_BASE:-.}"
     mkdir -p "$PATH_BASE" 2>/dev/null || { echo "ERROR: cannot create path '$PATH_BASE'"; exit 1; }
     case "$SUB" in
-      scan-apps|list-redis|ghosts) OUT="$PATH_BASE/forward" ;;    # forward scan artifacts
+      scan-apps|list-redis|ghosts|scan-ups) OUT="$PATH_BASE/forward" ;;    # forward scan artifacts
       merge)                       OUT="$PATH_BASE" ;;            # base: reads backward/ + forward/
       *)                           OUT="$PATH_BASE/backward" ;;   # backward scan artifacts
     esac
@@ -158,6 +158,7 @@ cf_paginate(){
     next=$(printf '%s' "$page" | jq -r '.pagination.next.href // "null"' 2>/dev/null)
     [ "$next" != "null" ] && [ -n "$next" ] && next="/v3/${next#*/v3/}"   # strip host -> path for cf curl
   done
+  return 0     # the test above is false on the last page; without this a successful listing exits 1
 }
 
 # ---------------------------------------------------------------- preflight ---
@@ -509,6 +510,85 @@ cmd_list_redis(){
   echo "list-redis: $n redis deployment(s) -> $out"
 }
 
+# scan-ups: USER-PROVIDED services that carry copied redis credentials ("a sticky note with a
+# Redis address on it"). A UPS provisions nothing, so it is invisible to scan-apps (not a redis-plan
+# SI) and to classify (the app's env has no REDIS_* key -- the creds arrive via VCAP_SERVICES); such
+# consumers used to surface only as live connections with method=unknown. This step enumerates every
+# UPS, reads its credentials, matches them against OUR redis (IP from backward/redis_ips.tsv,
+# deployment name, SI guid) and records which apps are bound to it.
+#   -> fwd_ups.tsv : app_guid  ups_guid  ups_name  ups_space  ups_org  target  redis_si_guid  kind
+#      kind = ours      : points at one of our redis  (merge: method "static-ref: ups", target = UPS name)
+#             external  : redis-shaped creds (redis:// URL / port 6379|16379) but not one of ours
+#      app_guid blank   : UPS exists but nothing is bound to it (standing copied credentials)
+# Needs a role that can read UPS credentials (admin / SpaceDeveloper): /v3/service_instances/:guid/credentials.
+# Run after scan-apps + list-redis (+ run, for the IP map); re-run merge afterwards.
+cmd_scan_ups(){
+  timeout 30 cf curl "/v3/apps?per_page=1" >/dev/null 2>&1 || die "cf not logged in / not targeted (scan-ups uses the current cf session)"
+  local sif="$OUT/fwd_redis_si.tsv" depf="$OUT/redis_deployments.tsv" ipsf="$PATH_BASE/backward/redis_ips.tsv"
+  [ -s "$sif" ]  || die "scan-ups: $sif missing -> run: scan-apps first"
+  [ -s "$depf" ] || die "scan-ups: $depf missing -> run: list-redis first"
+  [ -s "$ipsf" ] || echo "scan-ups: note -- $ipsf absent (no backward scan yet): matching by deployment name / SI guid only, not by IP" >&2
+  : > "$OUT/.api_errors"
+  echo "scan-ups :: user-provided services with redis credentials (CF API, current cf target)"
+
+  # space -> "space\torg" (same lookup scan-apps uses), and the three ways a UPS can name our redis
+  declare -A SPACE_INFO ORG_NAME DEP_OF_SI SI_OF_IP SI_OF_DEP
+  local g n
+  while IFS=$'\t' read -r g n; do [ -n "$g" ] && ORG_NAME["$g"]="$n"; done \
+    < <(cf_paginate "/v3/organizations?per_page=200" | jq -r '[.guid, .name] | @tsv')
+  local og
+  while IFS=$'\t' read -r g n og; do [ -n "$g" ] && SPACE_INFO["$g"]="$n"$'\t'"${ORG_NAME[$og]:-?}"; done \
+    < <(cf_paginate "/v3/spaces?per_page=200" | jq -r '[.guid, .name, .relationships.organization.data.guid] | @tsv')
+  api_errors_check "scan-ups (orgs/spaces)" || die "scan-ups aborted: the CF API rejected a list query"
+  local d si ip
+  while IFS=$'\t' read -r d si; do [ "$d" = redis_deployment ] && continue; [ -n "$si" ] && { DEP_OF_SI["$si"]="$d"; SI_OF_DEP["$d"]="$si"; }; done < "$depf"
+  [ -s "$ipsf" ] && while IFS=$'\t' read -r d ip; do [ -z "$ip" ] && continue; [ "${#d}" -ge 36 ] && SI_OF_IP["$ip"]="${d: -36}"; done < "$ipsf"
+
+  local out="$OUT/fwd_ups.tsv"
+  printf 'app_guid\tups_guid\tups_name\tups_space\tups_org\ttarget\tredis_si_guid\tkind\n' > "$out"
+  local ug un usg usp uorg creds e kind target tsi hosts h apps a nups=0 nours=0 next=0 nunread=0 nunbound=0
+  while IFS=$'\t' read -r ug un usg; do
+    [ -z "$ug" ] && continue
+    nups=$((nups+1))
+    local UNK2=$'?\t?'; IFS=$'\t' read -r usp uorg <<< "${SPACE_INFO[$usg]:-$UNK2}"
+    creds=$(timeout 20 cf curl "/v3/service_instances/$ug/credentials" 2>/dev/null)
+    e=$(api_err "$creds")
+    if [ -n "$e" ]; then api_fail "ups credentials $un ($ug)" "$e"; nunread=$((nunread+1)); continue; fi
+    kind=""; target=""; tsi=""
+    # 1) one of OUR redis: by IP (anchored), by deployment name (.bosh DNS), by SI guid
+    if [ "${#SI_OF_IP[@]}" -gt 0 ]; then for ip in "${!SI_OF_IP[@]}"; do
+      printf '%s' "$creds" | grep -qE "$(ip_re "$ip")" && { kind="ours"; target="$ip"; tsi="${SI_OF_IP[$ip]}"; break; }
+    done; fi
+    if [ -z "$kind" ]; then for d in "${!SI_OF_DEP[@]}"; do
+      printf '%s' "$creds" | grep -qF "$d" && { kind="ours"; target="$d"; tsi="${SI_OF_DEP[$d]}"; break; }
+    done; fi
+    if [ -z "$kind" ]; then for si in "${!DEP_OF_SI[@]}"; do
+      printf '%s' "$creds" | grep -qF "$si" && { kind="ours"; target="$si"; tsi="$si"; break; }
+    done; fi
+    # 2) redis-shaped but not ours (external redis / a redis we have no deployment for)
+    if [ -z "$kind" ]; then
+      hosts=$(_extract_redis_hosts "$creds" | head -1)
+      if [ -n "$hosts" ]; then kind="external"; target="$hosts"
+      elif printf '%s' "$creds" | grep -qE '"port"[[:space:]]*:[[:space:]]*"?(6379|16379)"?'; then
+        kind="external"; target=$(printf '%s' "$creds" | jq -r '.host // .hostname // .address // "?"' 2>/dev/null)
+      fi
+    fi
+    [ -z "$kind" ] && continue                      # not redis-related -> ignore
+    [ "$kind" = ours ] && nours=$((nours+1)) || next=$((next+1))
+    apps=$(cf_paginate "/v3/service_credential_bindings?type=app&service_instance_guids=$ug&per_page=200" | jq -r '.relationships.app.data.guid') || apps=""
+    if [ -z "$apps" ]; then
+      nunbound=$((nunbound+1))
+      printf '\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ug" "$un" "$usp" "$uorg" "$target" "${tsi:-?}" "$kind" >> "$out"
+    else
+      while IFS= read -r a; do [ -n "$a" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$ug" "$un" "$usp" "$uorg" "$target" "${tsi:-?}" "$kind" >> "$out"; done <<< "$apps"
+    fi
+  done < <(cf_paginate "/v3/service_instances?type=user-provided&per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid] | @tsv')
+
+  echo "scan-ups: $nups user-provided service(s) inspected"
+  echo "scan-ups: $nours point at OUR redis, $next at an external/unknown redis, $nunbound of those have no app bound, $nunread unreadable -> $out"
+  api_errors_check "scan-ups" || { echo "   UPS marked unreadable are NOT 'no redis' -- re-run with a role that can read UPS credentials" >&2; exit 3; }
+}
+
 # ghosts: cross-reference CF redis service instances (scan-apps) against BOSH deployments
 # (list-redis). Catches what neither side sees alone:
 #   GHOST-SI          : a CF service instance with NO BOSH deployment (CF says 'succeeded' but the
@@ -594,7 +674,8 @@ cmd_merge(){
   # the app_guid/redis_deployment we key on end up in the wrong field.
   local SEP=' ' UNK3=$'?\t?\t?' US=$'\037'
   declare -A APP_INFO SI_INFO DEP_OF_SI IP_TO_SI STAT_REF STAT_TGT
-  declare -A P_BIND P_LIVE P_PLAT P_METHB ALLKEYS APP_HAS_PAIR
+  declare -A P_BIND P_LIVE P_PLAT P_METHB ALLKEYS APP_HAS_PAIR P_UPS
+  local upsf="$fwd/fwd_ups.tsv"
   local a b c d e key app si dep plat meth s2
 
   # reference maps
@@ -612,6 +693,18 @@ cmd_merge(){
     [ "$app" = app_guid ] && continue
     [ -n "$app" ] && [ -n "$si" ] && { key="$app$SEP$si"; P_BIND["$key"]=1; ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1; }
   done < "$bindf"
+
+  # pairs from scan-ups (OPTIONAL): app bound to a user-provided service whose credentials point
+  # at one of our redis -> a copied-credential consumer. kind=ours rows with an app and a resolved SI.
+  local nups_pairs=0
+  if [ -s "$upsf" ]; then
+    while IFS="$US" read -r app si meth; do
+      [ -z "$app" ] || [ -z "$si" ] || [ "$si" = "?" ] && continue
+      key="$app$SEP$si"; P_UPS["$key"]="$meth"; ALLKEYS["$key"]=1; APP_HAS_PAIR["$app"]=1; nups_pairs=$((nups_pairs+1))
+    done < <(awk -F'\t' 'NR>1 && $8=="ours" {print $1 "\037" $7 "\037" $3}' "$upsf")
+  else
+    echo "merge: note -- $upsf absent (scan-ups not run): UPS copied-credential consumers can only appear as live connections with method=unknown"
+  fi
 
   # pairs from backward 06_classified (live connection). app_guid(13)/redis_deployment(12) are in
   # the MIDDLE -- extract via awk (US-separated) so blank static_ref cols can't shift them.
@@ -639,12 +732,15 @@ cmd_merge(){
     bound="no"; [ -n "${P_BIND[$key]:-}" ] && bound="yes"
     plat="${P_PLAT[$key]:-}"
     sref="${STAT_REF[$app]:-}"; stgt="${STAT_TGT[$app]:-}"
+    # a UPS pointing at this redis is a static reference too (frozen copy of the creds); it loses
+    # to env-var/manifest only in the static_ref label -- the target column names the UPS.
+    if [ -n "${P_UPS[$key]:-}" ] && [ -z "$sref" ]; then sref="ups"; stgt="${P_UPS[$key]}"; fi
     if [ "$bound" = yes ]; then method="cf-bind"
     elif [ -n "$sref" ]; then method="static-ref: $sref"
     elif [ -n "${P_METHB[$key]:-}" ]; then method="${P_METHB[$key]}"
     else method="unknown"; fi
     if [ "$bound" = yes ] && [ "$live" = yes ]; then src="both"
-    elif [ "$bound" = yes ]; then src="forward"
+    elif [ "$bound" = yes ] || { [ "$live" = no ] && [ -n "${P_UPS[$key]:-}" ]; }; then src="forward"
     else src="backward"; fi
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$aname" "$aspace" "$aorg" "$app" "$method" "$sref" "$stgt" "$sname" "$sspace" "$sorg" "$dep" "$si" "$plat" "$depx" "$live" "$src" >> "$out"
@@ -666,7 +762,8 @@ cmd_merge(){
 
   local nrows; nrows=$(($(wc -l < "$out") - 1))
   echo "merge: $nrows app<->redis row(s) -> $out"
-  echo "merge: (${#ALLKEYS[@]} bound/connected pair(s) + $pstat declared-static-only app(s))"
+  echo "merge: (${#ALLKEYS[@]} bound/connected pair(s) + $pstat declared-static-only app(s); $nups_pairs via a user-provided service)"
+  [ -s "$upsf" ] && { local nx; nx=$(awk -F'\t' 'NR>1 && $8=="external"' "$upsf" | cut -f2 | sort -u | wc -l | tr -d ' '); [ "$nx" -gt 0 ] && echo "merge: note -- $nx user-provided service(s) carry redis creds that are NOT one of ours (external redis) -> see $upsf kind=external"; }
 }
 
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;
@@ -1219,6 +1316,7 @@ case "$SUB" in
   run)             cmd_run ;;
   reclassify)      cmd_reclassify ;;
   scan-apps)       cmd_scan_apps ;;
+  scan-ups)        cmd_scan_ups ;;
   list-redis)      cmd_list_redis ;;
   ghosts)          cmd_ghosts ;;
   merge)           cmd_merge ;;

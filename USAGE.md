@@ -64,10 +64,18 @@ automatically; never stops on a single failure.
 
     bash redis-consumer-discovery.sh scan-apps  <env> --path ./np-scan
     bash redis-consumer-discovery.sh list-redis <env> --path ./np-scan
+    bash redis-consumer-discovery.sh scan-ups   <env> --path ./np-scan
 
 `scan-apps` sweeps the CF API: every app, service binding, env var, and manifest (this is the
 slow phase at thousands of apps; it needs a `cf` user that can read env vars — full admin).
 `list-redis` records which Redis deployments actually exist in BOSH.
+`scan-ups` reads every **user-provided service**'s credentials and matches them against our
+Redis (IP / deployment name / instance GUID): a UPS is a frozen copy of credentials that no
+binding scan can see, and without this step such consumers only appear as live connections with
+`method=unknown`. Output `forward/fwd_ups.tsv` (`kind=ours` → merge reports the bound apps as
+`static-ref: ups` with the UPS name as target; `kind=external` → the UPS points at a Redis that is
+not ours; blank `app_guid` → the UPS exists but nothing is bound to it). Needs a role that can
+read UPS credentials (admin / SpaceDeveloper); unreadable ones are counted and fail the step.
 
 Optional cross-check — service instances that exist in CF but have no BOSH deployment (and
 vice versa):

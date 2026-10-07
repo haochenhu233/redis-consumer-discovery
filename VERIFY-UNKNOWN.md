@@ -6,6 +6,11 @@ entry). App teams sometimes don't believe these rows ("we don't use that Redis")
 proves the connection **live**, from three independent viewpoints, and then hunts for the
 *why* — in front of the app team.
 
+> **Before chasing by hand:** run `scan-ups <env> --path …` and re-run `merge` if you have not.
+> The most common `unknown` is an app bound to a **user-provided service** holding copied Redis
+> credentials; `scan-ups` reclassifies those as `static-ref: ups` (target = the UPS name) and the
+> hunt below is unnecessary for them.
+
 Everything here is **read-only** (one clearly-marked optional exception). Run it on non-prod
 first. You need: the report row (app name / org / space, `redis_deployment`), `cf` admin
 login, bosh access via genesis, and — for Proof C — sudo on the Diego cell.

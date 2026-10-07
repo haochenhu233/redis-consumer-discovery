@@ -39,10 +39,13 @@ Visits every Redis deployment and identifies the apps currently connected to eac
 
     bash redis-consumer-discovery.sh scan-apps  <env> --path ./scan
     bash redis-consumer-discovery.sh list-redis <env> --path ./scan
+    bash redis-consumer-discovery.sh scan-ups   <env> --path ./scan
 
 `scan-apps` sweeps every app via the CF API (the slow part on big foundations); `list-redis`
 records which Redis deployments exist. This step also catches apps that were idle during
-Step 1.
+Step 1. `scan-ups` checks every user-provided service for copied Redis credentials — apps
+bound to such a UPS show up in the report as `static-ref: ups` (the team must update the UPS at
+migration time); without it they would be `unknown`.
 
 ## Step 3 — merge into the report
 
