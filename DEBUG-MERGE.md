@@ -51,6 +51,14 @@ col 14 = `redis_ip`.
 - If you see **13 columns** (no `platform`), this file was made by an **older build** than your
   merge script → `app_guid` is really col 12. Re-run the backward scan with the current script.
 
+Also check the **forward** side: `head -1 forward/app_base.tsv | tr '\t' '\n' | cat -n` should show
+**6** columns with col 6 = `platform` (scans since 2026-10-23). With 5 columns (older `scan-apps`),
+or a header damaged by CRLF/VDI copy, `merge` prints `app_base.tsv has no 'platform' as its 6th
+header field …` and takes platform from the backward scan only — Windows apps without a live
+connection then have a blank platform. With the column present it prints `platform from the
+forward scan (app stack) for N of M apps` and, if the app's stack and the cell type ever disagree,
+`WARNING -- N row(s) … disagree on platform; the stack was kept`.
+
 ## Step 3 — why is each row kept or skipped?
 
 ```bash

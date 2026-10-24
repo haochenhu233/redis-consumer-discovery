@@ -66,8 +66,10 @@ automatically; never stops on a single failure.
     bash redis-consumer-discovery.sh list-redis <env> --path ./np-scan
     bash redis-consumer-discovery.sh scan-ups   <env> --path ./np-scan
 
-`scan-apps` sweeps the CF API: every app, service binding, env var, and manifest (this is the
-slow phase at thousands of apps; it needs a `cf` user that can read env vars — full admin).
+`scan-apps` sweeps the CF API: every app (name, space, and its **stack** → `platform`), service
+binding, env var, and manifest (this is the slow phase at thousands of apps; it needs a `cf` user
+that can read env vars — full admin). It prints `platform from the app's stack: N windows, N linux,
+N unknown (of N)` — `unknown` is a stack name that is neither `windows*` nor `cflinuxfs*`.
 `list-redis` records which Redis deployments actually exist in BOSH.
 `scan-ups` reads every **user-provided service**'s credentials and matches them against our
 Redis (IP / deployment name / instance GUID): a UPS is a frozen copy of credentials that no
@@ -148,7 +150,11 @@ Redis than this row's (blank = same Redis, the normal case).
   **Idle apps still migrate** — don't skip them.
 - `deployment_exists` — `no` = the CF service instance has no BOSH deployment behind it (a
   ghost); bindings to it are dangling and need cleanup, not migration.
-- `platform` — `windows` or `linux` cell; same migration either way.
+- `platform` — `windows` or `linux`, from the **app's stack** (forward scan, since 2026-10-23); the
+  cell type of a live connection is the fallback (and the only source for scans made with an older
+  `scan-apps`, where Windows apps without a live connection stayed blank). Blank = stack unknown and
+  no live connection. `merge` warns when stack and cell disagree. Same migration either way, but
+  the migration tool drills Windows apps separately, so the count matters.
 - `source` — `both` (configured + connected), `forward` (configured only), `backward`
   (connected but no binding found).
 - `space`/`org` vs `redis_service_space`/`redis_service_org` — when they differ, the app uses

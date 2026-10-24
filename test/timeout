@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# timeout stub for the offline cases on macOS (no coreutils timeout): drop the duration, run the command
+shift; exec "$@"

@@ -403,21 +403,30 @@ cmd_scan_apps(){
   api_errors_check "scan-apps (spaces)" || die "scan-apps aborted: the CF API rejected the spaces query"
   echo "scan-apps: ${#SPACE_INFO[@]} space(s)"
 
-  # apps: guid, name, space -> app_base.tsv
+  # apps: guid, name, space, platform -> app_base.tsv
+  # platform (2026-10-23): from the app's lifecycle stack -- windows* = windows, cflinuxfs* or a docker
+  # lifecycle = linux, anything else '?' (never blank: a blank last column collapses under tab-split reads).
+  # Before this, platform came from the backward scan only, so a Windows app with no live connection was
+  # never known as Windows; merge now prefers this column and falls back to the backward value.
   local out="$OUT/app_base.tsv"
-  printf 'env\tapp_guid\tapp_name\tspace\torg\n' > "$out"
-  local ag an asg info spn orgn n=0
-  while IFS=$'\t' read -r ag an asg; do
-    [ -z "$ag" ] && continue
+  printf 'env\tapp_guid\tapp_name\tspace\torg\tplatform\n' > "$out"
+  # five fields per app: a null anywhere (no space, no lifecycle) must not shift the others, so every field is
+  # defaulted to "-" in jq and the record is joined with \037, never read tab-split (review 2026-10-23, row 4)
+  local ag an asg ltype lstack plat info spn orgn n=0 nwin=0 nlin=0 nunk=0
+  while IFS=$'\037' read -r ag an asg ltype lstack; do
+    [ -z "$ag" ] || [ "$ag" = "-" ] && continue
     info="${SPACE_INFO[$asg]:-}"
     if [ -n "$info" ]; then IFS=$'\t' read -r spn orgn <<< "$info"; else spn="?"; orgn="?"; fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$ENV" "$ag" "$an" "$spn" "$orgn" >> "$out"
+    case "$lstack" in [Ww]indows*) plat="windows"; nwin=$((nwin+1));; cflinuxfs*) plat="linux"; nlin=$((nlin+1));;
+      *) if [ "$ltype" = docker ]; then plat="linux"; nlin=$((nlin+1)); else plat="?"; nunk=$((nunk+1)); fi;; esac
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$ag" "$an" "$spn" "$orgn" "$plat" >> "$out"
     n=$((n+1))
-  done < <(cf_paginate "/v3/apps?per_page=200" | jq -r '[.guid, .name, .relationships.space.data.guid] | @tsv')
+  done < <(cf_paginate "/v3/apps?per_page=200" | jq -r '[(.guid // "-"), ((.name // "-") | tostring | gsub("[\t\r\n]"; " ")), (.relationships.space.data.guid? // "-"), (.lifecycle.type? // "-"), (.lifecycle.data.stack? // "-")] | map(if . == "" then "-" else . end) | join("\u001f")')
 
   api_errors_check "scan-apps (orgs/spaces/apps)" || die "scan-apps aborted: the CF API rejected a list query -- the app inventory would be incomplete"
   local total; total=$(timeout 30 cf curl "/v3/apps?per_page=1" 2>/dev/null | jq -r '.pagination.total_results // "?"' 2>/dev/null)
   echo "scan-apps: enumerated $n app(s) -> $out"
+  echo "scan-apps: platform from the app's stack: $nwin windows, $nlin linux, $nunk unknown (of $n)"
   echo "scan-apps: CF API reports total_results=$total  (should match $n)"
 
   # STEP 2: cf-bind detection. redis offering -> plans -> service instances -> app bindings.
@@ -681,6 +690,16 @@ cmd_merge(){
   # reference maps
   while IFS="$US" read -r b c d e; do [ -n "$b" ] && APP_INFO["$b"]="$c"$'\t'"$d"$'\t'"$e"; done \
     < <(awk -F'\t' 'NR>1{print $2 "\037" $3 "\037" $4 "\037" $5}' "$appf")
+  # forward platform (app_base.tsv column 6, scans since 2026-10-23; an older file has 5 columns -> backward only)
+  declare -A APP_PLAT; local n_fplat=0 n_fapps=0
+  if [ "$(head -1 "$appf" | tr -d '\r' | awk -F'\t' '{print $6}')" = platform ]; then   # CR-tolerant (a file copied through the VDI)
+    local n_fodd=0
+    while IFS="$US" read -r b c; do [ -n "$b" ] || continue; n_fapps=$((n_fapps+1)); c=$(printf '%s' "$c" | tr 'A-Z' 'a-z')
+      case "$c" in windows|linux) APP_PLAT["$b"]="$c"; n_fplat=$((n_fplat+1));; "?") ;; *) n_fodd=$((n_fodd+1));; esac; done \
+      < <(awk -F'\t' 'NR>1{sub(/\r$/,""); print $2 "\037" $6}' "$appf")
+    local odd=""; if [ "$n_fodd" != 0 ]; then odd="; $n_fodd row(s) with a value that is neither windows/linux/? (hand-edited?) -- ignored"; fi
+    echo "merge: platform from the forward scan (app stack) for $n_fplat of $n_fapps apps; backward (cell) value is the fallback$odd"
+  else echo "merge: app_base.tsv has no 'platform' as its 6th header field (older scan-apps, or a damaged header -- DEBUG-MERGE.md step 1) -- platform from the backward scan only (Windows apps without a live connection stay unknown)"; fi
   [ -s "$sif" ]  && while IFS="$US" read -r a b c d; do [ -n "$a" ] && SI_INFO["$a"]="$b"$'\t'"$c"$'\t'"$d"; done \
     < <(awk -F'\t' 'NR>1{print $1 "\037" $2 "\037" $3 "\037" $4}' "$sif")
   [ -s "$depf" ] && while IFS=$'\t' read -r a b;       do [ "$a" = redis_deployment ] && continue; [ -n "$b" ] && DEP_OF_SI["$b"]="$a"; done < "$depf"
@@ -739,7 +758,7 @@ cmd_merge(){
     done < <(printf '%s\n' "$list" | tr ';' '\n')
     printf '%s' "$out"; }
 
-  local aname aspace aorg sname sspace sorg depx live bound plat sref stgt method src
+  local aname aspace aorg sname sspace sorg depx live bound plat sref stgt method src n_pconf=0
   for key in "${!ALLKEYS[@]}"; do
     app="${key% *}"; si="${key#* }"
     IFS=$'\t' read -r aname aspace aorg <<< "${APP_INFO[$app]:-$UNK3}"
@@ -748,6 +767,9 @@ cmd_merge(){
     live="no"; [ -n "${P_LIVE[$key]:-}" ] && live="yes"
     bound="no"; [ -n "${P_BIND[$key]:-}" ] && bound="yes"
     plat="${P_PLAT[$key]:-}"
+    if [ -n "${APP_PLAT[$app]:-}" ]; then   # forward (the app's stack) wins; a disagreeing backward value is counted, not silently dropped
+      [ -n "$plat" ] && [ "$plat" != "${APP_PLAT[$app]}" ] && n_pconf=$((n_pconf+1))
+      plat="${APP_PLAT[$app]}"; fi
     sref="${STAT_REF[$app]:-}"; stgt="$(_annot_targets "${STAT_TGT[$app]:-}" "$si")"
     # a UPS pointing at this redis is a static reference too (frozen copy of the creds); it loses
     # to env-var/manifest only in the static_ref label -- the target column names the UPS.
@@ -772,15 +794,17 @@ cmd_merge(){
     [ -n "${IP_TO_SI[$h]:-}" ] && si="${IP_TO_SI[$h]}"
     IFS=$'\t' read -r sname sspace sorg <<< "${SI_INFO[$si]:-$UNK3}"
     dep="${DEP_OF_SI[$si]:-}"; depx="no"; [ -n "$dep" ] && depx="yes" || dep="(none)"
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,,%s,%s,%s\n' \
-      "$aname" "$aspace" "$aorg" "$app" "static-ref: ${STAT_REF[$app]}" "${STAT_REF[$app]}" "$stgt" "$sname" "$sspace" "$sorg" "$dep" "$si" "$depx" "no" "forward" >> "$out"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$aname" "$aspace" "$aorg" "$app" "static-ref: ${STAT_REF[$app]}" "${STAT_REF[$app]}" "$stgt" "$sname" "$sspace" "$sorg" "$dep" "$si" "${APP_PLAT[$app]:-}" "$depx" "no" "forward" >> "$out"
     pstat=$((pstat+1))
   done
+  [ "$n_pconf" = 0 ] || echo "merge: WARNING -- $n_pconf row(s) where the app's stack (forward) and the cell type (backward) disagree on platform; the stack was kept -- check those apps' cells (cellmap) before trusting either"
 
   local nrows; nrows=$(($(wc -l < "$out") - 1))
   echo "merge: $nrows app<->redis row(s) -> $out"
   echo "merge: (${#ALLKEYS[@]} bound/connected pair(s) + $pstat declared-static-only app(s); $nups_pairs via a user-provided service)"
   [ -s "$upsf" ] && { local nx; nx=$(awk -F'\t' 'NR>1 && $8=="external"' "$upsf" | cut -f2 | sort -u | wc -l | tr -d ' '); [ "$nx" -gt 0 ] && echo "merge: note -- $nx user-provided service(s) carry redis creds that are NOT one of ours (external redis) -> see $upsf kind=external"; }
+  return 0   # the line above is false without fwd_ups.tsv (no scan-ups run) AND with one that lists no external UPS; before this it was merge's exit status -- a successful merge exited 1 unless an external UPS existed (found 2026-10-23)
 }
 
 # _census_one <dep> <outfile>: census ONE redis deployment into its OWN file (parallel-safe;

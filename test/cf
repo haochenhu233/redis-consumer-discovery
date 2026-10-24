@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# `cf` for the offline cases -> cf-stub (a script, not a symlink: a git-bash checkout would turn a symlink into a text file)
+exec "$(dirname "$0")/cf-stub" "$@"
