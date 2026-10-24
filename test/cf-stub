@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# cf-stub -- stands in for `cf` in the offline cases: `cf curl <path>` answers from $CFSTUB_DIR/<file>.json,
-# where <file> is the path with every non-alphanumeric character turned into '_' (query string included);
-# a path with no file answers an empty, well-formed list. Everything else `cf` is asked exits 0 silently.
-# Put the directory holding this file (it also holds a `timeout` stub for macOS) first in PATH as `cf`.
+# cf-stub -- stands in for `cf` in the offline cases: `cf curl <path>` answers from $CFSTUB_DIR/<file>.json
+# (or <file>.yml, for the manifest endpoint, which answers YAML on the real CF), where <file> is the path
+# with every non-alphanumeric character turned into '_' (query string included). An EMPTY file answers
+# nothing (a timeout); a path with no file answers an empty, well-formed list. Everything else `cf` is
+# asked exits 0 silently. Put the directory holding this file (it also holds a `timeout` stub for macOS)
+# first in PATH as `cf`.
 set -u
 [ "${1:-}" = curl ] || exit 0
-p="${2:-}"; f="$CFSTUB_DIR/$(printf '%s' "$p" | sed 's/[^A-Za-z0-9]/_/g').json"
-if [ -s "$f" ]; then cat "$f"; else printf '{"pagination":{"total_results":0,"next":null},"resources":[]}\n'; fi
+p="${2:-}"; b="$CFSTUB_DIR/$(printf '%s' "$p" | sed 's/[^A-Za-z0-9]/_/g')"
+for f in "$b.json" "$b.yml"; do [ -e "$f" ] && { cat "$f"; exit 0; }; done
+printf '{"pagination":{"total_results":0,"next":null},"resources":[]}\n'

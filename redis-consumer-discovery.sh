@@ -138,6 +138,14 @@ api_err(){ local j="$1"
   [ -z "$j" ] && { echo "empty response (timeout / not logged in?)"; return; }
   printf '%s' "$j" | jq -e . >/dev/null 2>&1 || { echo "non-JSON response"; return; }
   printf '%s' "$j" | jq -r 'if type=="object" and has("errors") then [.errors[] | "\(.title // "error"): \(.detail // "")"] | join("; ") else empty end' 2>/dev/null; }
+# man_err <body>: like api_err, for /v3/apps/:guid/manifest ONLY -- that endpoint answers YAML on success
+# (api_err would score every manifest "non-JSON response": 2026-10-24, every manifest of a 5.5k-app scan).
+# Errors still come back as JSON (404/403), so: empty -> error; JSON -> its errors, or "not a manifest";
+# anything else must carry an 'applications:' block.
+man_err(){ local b="$1"
+  [ -z "$b" ] && { echo "empty response (timeout / not logged in?)"; return; }
+  if printf '%s' "$b" | jq -e . >/dev/null 2>&1; then local e; e=$(api_err "$b"); echo "${e:-unexpected JSON body (a manifest is YAML)}"; return; fi
+  printf '%s\n' "$b" | grep -q '^applications:' || echo "unexpected manifest body (no applications: block)"; }
 # api_fail <what> <error>: report loudly AND record in $OUT/.api_errors. Needed because most calls
 # run inside pipelines / background workers, where exit cannot stop the parent; the command checks
 # the marker file and fails at the end.
@@ -361,7 +369,7 @@ _scan_app_static(){
   env=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null); e=$(api_err "$env")
   [ -n "$e" ] && { sleep 1; env=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null); e=$(api_err "$env"); }   # one retry
   [ -n "$e" ] && { printf '%s\t%s\n' "$ag" "$e" >> "$errf"; return 0; }      # unreadable env: recorded, NOT treated as "no static ref"
-  man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null); e=$(api_err "$man")
+  man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null); e=$(man_err "$man")   # YAML endpoint: man_err, not api_err
   [ -n "$e" ] && { printf '%s\t%s\n' "$ag" "$e" >> "$(dirname "$out")/../.man_errors"; man=""; }
   if printf '%s' "$env" | grep -qiE "$gpat" 2>/dev/null; then sr="env-var"
   elif printf '%s' "$man" | grep -qiE "$gpat" 2>/dev/null; then sr="manifest"; fi
@@ -1180,7 +1188,7 @@ cmd_classify(){
         ENVDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/environment_variables" 2>/dev/null)
         local ee; ee=$(api_err "${ENVDATA[$ag]}"); [ -n "$ee" ] && { ENVERR[$ag]=1; api_fail "environment app=$ag" "$ee"; }
         MANDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
-        ee=$(api_err "${MANDATA[$ag]}"); [ -n "$ee" ] && MANDATA[$ag]=""
+        ee=$(man_err "${MANDATA[$ag]}"); [ -n "$ee" ] && MANDATA[$ag]=""   # YAML endpoint: man_err, not api_err
       fi
       in_env=""; in_man=""
       printf '%s' "${ENVDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_env=1
