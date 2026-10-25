@@ -135,6 +135,7 @@ service_instance_guid, platform, deployment_exists, live_connection, source`
 | `cf-bind` | Standard service binding. | Migrated by the platform. No app-team action. |
 | `static-ref: env-var` | Redis address set in the app's env vars. | Update the env var to the new details. |
 | `static-ref: manifest` | Redis address on the start command / sidecar. | Update the manifest and re-push. |
+| `static-ref: env-key` | No address, but the app has an env var **named** after redis (`REDIS_SERVICE`, `myRedisName`, `REDIS_PASSWORD` …) — it picks or configures its store by hand; `static_ref_target` lists the names (`key:…`), never the values. On a bound app this also makes it a **hazard** in the plan. | App team confirms what the variable does; a label/name selector is set to the new value before the app's wave. |
 | `unknown` | App identified, but its Redis config isn't visible to the platform (config file / config server). | App-team review. |
 | `unresolved` | Connection seen but the app couldn't be identified in that scan. | Transient — re-run the scan. |
 | `external` | A connection from outside Cloud Foundry. | Service-owner review. |

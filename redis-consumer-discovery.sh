@@ -371,10 +371,13 @@ _scan_app_static(){
   [ -n "$e" ] && { printf '%s\t%s\n' "$ag" "$e" >> "$errf"; return 0; }      # unreadable env: recorded, NOT treated as "no static ref"
   man=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null); e=$(man_err "$man")   # YAML endpoint: man_err, not api_err
   [ -n "$e" ] && { printf '%s\t%s\n' "$ag" "$e" >> "$(dirname "$out")/../.man_errors"; man=""; }
+  local keys=""
   if printf '%s' "$env" | grep -qiE "$gpat" 2>/dev/null; then sr="env-var"
-  elif printf '%s' "$man" | grep -qiE "$gpat" 2>/dev/null; then sr="manifest"; fi
+  elif printf '%s' "$man" | grep -qiE "$gpat" 2>/dev/null; then sr="manifest"
+  else keys=$(_redis_keys "$env"); [ -n "$keys" ] && sr="env-key"; fi   # a variable NAMED after redis, value not host-like
   [ -z "$sr" ] && return 0                              # no static redis ref -> nothing to record
-  tgt=$( { _extract_redis_hosts "$env"; _extract_redis_hosts "$man"; } | awk 'NF' | sort -u | paste -sd';' - )
+  if [ "$sr" = env-key ]; then tgt="key:$keys"
+  else tgt=$( { _extract_redis_hosts "$env"; _extract_redis_hosts "$man"; } | awk 'NF' | sort -u | paste -sd';' - ); fi
   printf '%s\t%s\t%s\n' "$ag" "$sr" "$tgt" >> "$out"
 }
 
@@ -1071,6 +1074,11 @@ cmd_resolve(){
 # CF env-vars JSON or manifest YAML blob -- values of REDIS*/VALKEY* host-ish keys, and the
 # host inside redis://[user:pass@]host[:port] URLs. Best-effort; used to show WHERE a static
 # reference points when it is not this row's redis.
+# _redis_keys <env JSON>: the app's OWN variables (.var) whose NAME contains "redis" in any case, sorted, ;-joined.
+# Names only -- never a value: REDIS_PASSWORD is a hit and its value must not reach the report. Such a variable
+# means the app selects or configures its store by hand (REDIS_SERVICE=redis picks the binding by offering label:
+# after the rebind the label is valkey and the lookup is empty -- ext 2026-10-25, ioredis ERR_MISSING_ARGS).
+_redis_keys(){ printf '%s' "$1" | jq -r '(.var // {}) | keys[] | select(test("redis"; "i"))' 2>/dev/null | LC_ALL=C sort | paste -sd';' -; }   # C order: same on macOS and Linux
 _extract_redis_hosts(){
   local blob="$1"
   printf '%s' "$blob" \
@@ -1087,6 +1095,9 @@ _extract_redis_hosts(){
 #                          or `cf set-env` -- indistinguishable, both land in the CF env store)
 #   static-ref: manifest : redis appears elsewhere in the reconstructed manifest (command:,
 #                          sidecars:) but NOT in env vars
+#   static-ref: env-key  : no address anywhere, but the app has a variable NAMED after redis
+#                          (REDIS_SERVICE, myRedisName, REDIS_PASSWORD ...): it selects or
+#                          configures its store by hand; target = key:<names>, values never shown
 #   unknown              : app IDENTIFIED, connects, but redis appears nowhere CF can see ->
 #                          droplet config file / config-server / copied creds (app-team follow-up)
 #   unresolved           : live connection seen but the APP was not identified this scan
@@ -1190,12 +1201,14 @@ cmd_classify(){
         MANDATA[$ag]=$(timeout 20 cf curl "/v3/apps/$ag/manifest" 2>/dev/null)
         ee=$(man_err "${MANDATA[$ag]}"); [ -n "$ee" ] && MANDATA[$ag]=""   # YAML endpoint: man_err, not api_err
       fi
-      in_env=""; in_man=""
+      in_env=""; in_man=""; in_key=""; local _keys=""
       printf '%s' "${ENVDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_env=1
       printf '%s' "${MANDATA[$ag]}" | grep -qiE "$pat" 2>/dev/null && in_man=1
+      [ -z "${ENVERR[$ag]:-}" ] && _keys=$(_redis_keys "${ENVDATA[$ag]}"); [ -n "$_keys" ] && in_key=1   # a variable NAMED after redis
       # env-var wins over manifest (the reconstructed manifest also contains the env: block, so
-      # an env match shows up in both -- attribute it to env-var, not manifest).
-      if [ -n "$in_env" ]; then staticref="env-var"; elif [ -n "$in_man" ]; then staticref="manifest"; fi
+      # an env match shows up in both -- attribute it to env-var, not manifest); env-key is the
+      # weakest claim (a name, no address) and only stands when neither holds an address.
+      if [ -n "$in_env" ]; then staticref="env-var"; elif [ -n "$in_man" ]; then staticref="manifest"; elif [ -n "$in_key" ]; then staticref="env-key"; fi
       [ -n "${ENVERR[$ag]:-}" ] && staticref="unreadable"     # env could not be read: say so, do not imply "no static ref"
 
       # static_ref_target: when the app statically references a redis, find the target host it
@@ -1230,6 +1243,7 @@ cmd_classify(){
             strTarget="$_div"
           fi
         fi
+      elif [ "$staticref" = "env-key" ]; then strTarget="key:$_keys"   # the names, never the values
       fi
 
       # primary method: bind wins; else the static reference; else nothing visible -> unknown
@@ -1237,6 +1251,7 @@ cmd_classify(){
       elif [ "${bcount:-0}" -gt 0 ] 2>/dev/null; then method="cf-bind"
       elif [ "$staticref" = "env-var" ];  then method="static-ref: env-var"
       elif [ "$staticref" = "manifest" ]; then method="static-ref: manifest"
+      elif [ "$staticref" = "env-key" ];  then method="static-ref: env-key"
       else method="unknown"; fi
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$e" "$name" "$sp" "$org" "$platform" "$method" "$staticref" "$strTarget" "$svcname" "$svc_space" "$svc_org" "$dep" "$ag" "$rip" >> "$out"
